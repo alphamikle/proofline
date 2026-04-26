@@ -1,0 +1,7 @@
+.venv/
+data/
+repos/
+config.yaml
+__pycache__/
+*.pyc
+.DS_Store

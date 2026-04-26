@@ -1,0 +1,120 @@
+workspace: ./data
+repos:
+  root: ./repos
+  # Optional: if present, pipeline can clone missing repos. One URL per line.
+  clone_urls_file: null
+  update_existing: false
+  include_git_history_metadata: true
+  max_file_mb: 2
+  exclude_dirs:
+    - .git
+    - node_modules
+    - vendor
+    - dist
+    - build
+    - target
+    - .venv
+    - venv
+    - __pycache__
+    - .terraform
+    - .next
+    - coverage
+  include_extensions:
+    - .py
+    - .js
+    - .jsx
+    - .ts
+    - .tsx
+    - .java
+    - .kt
+    - .go
+    - .rb
+    - .php
+    - .cs
+    - .rs
+    - .scala
+    - .swift
+    - .m
+    - .h
+    - .cpp
+    - .c
+    - .sql
+    - .yaml
+    - .yml
+    - .json
+    - .toml
+    - .xml
+    - .gradle
+    - .proto
+    - .graphql
+    - .md
+    - .tf
+    - .sh
+    - .dockerfile
+    - Dockerfile
+
+storage:
+  duckdb_path: ./data/kb.duckdb
+  sqlite_fts_path: ./data/indexes/code_fts.sqlite
+
+datadog:
+  enabled: true
+  site: datadoghq.com
+  envs: [prod]
+  windows_days: [7, 30, 90]
+  service_dependencies: true
+  service_definitions: true
+  spans:
+    enabled: true
+    query: "*"
+    # Datadog Spans API is rate limited; keep conservative for first run.
+    max_pages_per_window: 20
+    page_limit: 1000
+  logs:
+    enabled: true
+    query: "*"
+    max_pages_per_window: 20
+    page_limit: 1000
+  # Field aliases are used to normalize logs/spans from different teams.
+  field_aliases:
+    service: [service, service.name, dd.service, app, application]
+    env: [env, environment, dd.env]
+    version: [version, dd.version, git.sha, git.commit.sha]
+    trace_id: [trace_id, trace.id, dd.trace_id]
+    span_id: [span_id, span.id, dd.span_id]
+    parent_id: [parent_id, parent.span_id]
+    route: [http.route, route, resource_name, resource, path]
+    method: [http.method, method]
+    status_code: [http.status_code, status_code, status]
+    url: [http.url, url, request.url]
+    host: [host, http.host, peer.hostname, net.peer.name]
+    peer_service: [peer.service, downstream_service, target_service, called_service]
+    db_name: [db.name, database, db.instance]
+    messaging_destination: [messaging.destination, kafka.topic, topic, queue]
+    duration_ms: [duration_ms, duration, elapsed_ms, latency_ms]
+
+bigquery:
+  enabled: true
+  project_id: null        # defaults to GOOGLE_CLOUD_PROJECT if null
+  regions: [region-us]
+  windows_days: [30, 180]
+  pull_jobs: true
+  pull_schemas: true
+  pull_lineage: false     # optional, not implemented by default; placeholder
+  max_results: null       # optional limit for dry runs
+
+indexing:
+  lexical_fts: true
+  embeddings:
+    enabled: false
+    model_name: all-MiniLM-L6-v2
+    batch_size: 32
+    max_chunks: null
+
+agent:
+  provider: none          # none | command
+  command: null           # example: "llm -m claude-3.5-sonnet"
+  max_context_chars: 100000
+  require_evidence: true
+  default_env: prod
+  default_window_days: 30

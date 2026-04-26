@@ -1,0 +1,4 @@
+# Optional heavy dependencies. Install only if you want local vector embeddings.
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0
