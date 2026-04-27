@@ -14,7 +14,7 @@ LANG_BY_EXT = {
     ".java": "java", ".kt": "kotlin", ".go": "go", ".rb": "ruby", ".php": "php", ".cs": "csharp",
     ".rs": "rust", ".scala": "scala", ".swift": "swift", ".sql": "sql", ".yaml": "yaml", ".yml": "yaml",
     ".json": "json", ".toml": "toml", ".xml": "xml", ".gradle": "gradle", ".proto": "protobuf",
-    ".graphql": "graphql", ".md": "markdown", ".tf": "terraform", ".sh": "shell",
+    ".graphql": "graphql", ".md": "markdown", ".tf": "terraform", ".sh": "shell", ".dart": "dart",
 }
 
 SYMBOL_PATTERNS = [

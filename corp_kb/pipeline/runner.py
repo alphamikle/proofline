@@ -24,6 +24,9 @@ from corp_kb.extractors.graph_build import build_graph
 from corp_kb.extractors.endpoint_map import build_endpoint_dependency_map
 from corp_kb.extractors.capabilities import build_capabilities
 from corp_kb.extractors.compatibility import build_compatibility_index
+from corp_kb.extractors.embeddings import build_code_embeddings
+from corp_kb.extractors.neo4j_export import export_graph_to_neo4j
+from corp_kb.extractors.code_graph import import_code_graph, run_code_graph_index
 
 app = typer.Typer(help="Local corporate code/runtime/data knowledge graph POC pipeline")
 
@@ -92,6 +95,13 @@ def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
     console.print(f"chunks: {len(chunks)}")
 
 
+def stage_embeddings(kb: KB, cfg: Dict[str, Any]) -> None:
+    meta, details = build_code_embeddings(kb, cfg)
+    if not meta.empty:
+        kb.replace_df("code_embedding_index", meta)
+    console.print(f"embeddings: {details}")
+
+
 def stage_api_surface(kb: KB, cfg: Dict[str, Any]) -> None:
     inv = kb.query_df("SELECT * FROM repo_inventory")
     files = kb.query_df("SELECT * FROM repo_files")
@@ -101,6 +111,19 @@ def stage_api_surface(kb: KB, cfg: Dict[str, Any]) -> None:
     kb.replace_df("api_contracts", contracts)
     kb.replace_df("api_endpoints", endpoints)
     console.print(f"contracts: {len(contracts)}, endpoints: {len(endpoints)}")
+
+
+def stage_code_graph(kb: KB, cfg: Dict[str, Any]) -> None:
+    if cfg.get("code_graph", {}).get("clear_existing", True):
+        kb.execute("DELETE FROM code_graph_runs")
+        kb.execute("DELETE FROM code_graph_symbols")
+        kb.execute("DELETE FROM code_graph_edges")
+    runs = run_code_graph_index(kb, cfg)
+    symbols, edges = import_code_graph(kb, cfg)
+    kb.replace_df("code_graph_symbols", symbols)
+    kb.replace_df("code_graph_edges", edges)
+    counts = runs["status"].value_counts().to_dict() if not runs.empty else {}
+    console.print(f"code graph runs: {counts}, symbols: {len(symbols)}, edges: {len(edges)}")
 
 
 def stage_static_edges(kb: KB, cfg: Dict[str, Any]) -> None:
@@ -162,6 +185,8 @@ def stage_graph(kb: KB, cfg: Dict[str, Any]) -> None:
         kb.query_df("SELECT * FROM runtime_endpoint_edges"),
         kb.query_df("SELECT * FROM bq_table_usage"),
         kb.query_df("SELECT * FROM ownership"),
+        kb.query_df("SELECT * FROM code_graph_symbols"),
+        kb.query_df("SELECT * FROM code_graph_edges"),
     )
     kb.replace_df("nodes", nodes)
     kb.replace_df("edges", edges)
@@ -188,8 +213,25 @@ def stage_capabilities(kb: KB, cfg: Dict[str, Any]) -> None:
     console.print(f"capabilities: {len(caps)}, compatibility risk entities: {len(compat)}")
 
 
+def stage_neo4j_export(kb: KB, cfg: Dict[str, Any]) -> None:
+    result = export_graph_to_neo4j(kb, cfg)
+    kb.append_df("neo4j_exports", result)
+    row = result.iloc[0].to_dict() if not result.empty else {}
+    console.print(f"neo4j export: {row.get('status')}, nodes={row.get('node_count')}, edges={row.get('edge_count')}")
+
+
 def stage_smoke(kb: KB, cfg: Dict[str, Any]) -> None:
-    tables = ["repo_inventory", "service_identity", "api_endpoints", "edges", "endpoint_dependency_map", "data_capabilities"]
+    tables = [
+        "repo_inventory",
+        "service_identity",
+        "api_endpoints",
+        "code_embedding_index",
+        "code_graph_symbols",
+        "code_graph_edges",
+        "edges",
+        "endpoint_dependency_map",
+        "data_capabilities",
+    ]
     rows = []
     for t in tables:
         n = kb.query_df(f"SELECT COUNT(*) AS n FROM {t}").iloc[0]["n"]
@@ -200,7 +242,9 @@ def stage_smoke(kb: KB, cfg: Dict[str, Any]) -> None:
 STAGES: Dict[str, Callable[[KB, Dict[str, Any]], None]] = {
     "repo_ingest": stage_repo_ingest,
     "code_index": stage_code_index,
+    "embeddings": stage_embeddings,
     "api_surface": stage_api_surface,
+    "code_graph": stage_code_graph,
     "static_edges": stage_static_edges,
     "datadog": stage_datadog,
     "bigquery": stage_bigquery,
@@ -208,12 +252,13 @@ STAGES: Dict[str, Callable[[KB, Dict[str, Any]], None]] = {
     "graph": stage_graph,
     "endpoint_map": stage_endpoint_map,
     "capabilities": stage_capabilities,
+    "neo4j_export": stage_neo4j_export,
     "smoke": stage_smoke,
 }
 
 FULL_ORDER = [
-    "repo_ingest", "code_index", "api_surface", "static_edges", "datadog", "bigquery",
-    "entity_resolution", "graph", "endpoint_map", "capabilities", "smoke",
+    "repo_ingest", "code_index", "embeddings", "api_surface", "code_graph", "static_edges", "datadog", "bigquery",
+    "entity_resolution", "graph", "endpoint_map", "capabilities", "neo4j_export", "smoke",
 ]
 
 

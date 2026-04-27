@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from corp_kb.extractors.entity_resolution import canonicalize
+from corp_kb.utils import normalize_name
 from corp_kb.utils import stable_id, json_dumps, now_iso
 
 
@@ -18,17 +18,36 @@ def build_graph(
     runtime_endpoint_edges: pd.DataFrame,
     bq_usage: pd.DataFrame,
     ownership: pd.DataFrame,
+    code_graph_symbols: pd.DataFrame | None = None,
+    code_graph_edges: pd.DataFrame | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     evidence: List[Dict[str, Any]] = []
+    alias_exact: Dict[str, str] = {}
+    alias_norm: Dict[str, str] = {}
+    if aliases is not None and not aliases.empty:
+        for _, a in aliases.iterrows():
+            alias = str(a.get("alias") or "")
+            canonical = str(a.get("canonical_id") or "")
+            if alias and canonical:
+                alias_exact[alias.lower()] = canonical
+                alias_norm[normalize_name(alias)] = canonical
+
+    def canon(raw: str) -> str:
+        if not raw:
+            return ""
+        hit = alias_exact.get(raw.lower())
+        if hit:
+            return hit
+        return alias_norm.get(normalize_name(raw), raw)
 
     def add_node(node_id: str, node_type: str, display: str, source: str, confidence: float, props: Dict[str, Any] | None = None):
-        nodes.append({"node_id": node_id, "node_type": node_type, "display_name": display, "source": source, "confidence": confidence, "properties": json_dumps(props or {})})
+        nodes.append({"node_id": node_id, "node_type": node_type, "display_name": display, "source": source, "confidence": confidence, "properties": json_dumps(jsonable(props or {}))})
 
-    def add_edge(from_node: str, to_node: str, edge_type: str, source: str, confidence: float, env: str = "", first_seen: str = "", last_seen: str = "", props: Dict[str, Any] | None = None, ev_refs: List[str] | None = None):
-        edge_id = stable_id(from_node, to_node, edge_type, source, env)
-        edges.append({"edge_id": edge_id, "from_node": from_node, "to_node": to_node, "edge_type": edge_type, "env": env, "source": source, "first_seen": first_seen, "last_seen": last_seen, "confidence": confidence, "evidence_refs": json_dumps(ev_refs or [edge_id]), "properties": json_dumps(props or {})})
+    def add_edge(from_node: str, to_node: str, edge_type: str, source: str, confidence: float, env: str = "", first_seen: str = "", last_seen: str = "", props: Dict[str, Any] | None = None, ev_refs: List[str] | None = None, edge_id_override: str | None = None):
+        edge_id = edge_id_override or stable_id(from_node, to_node, edge_type, source, env)
+        edges.append({"edge_id": edge_id, "from_node": from_node, "to_node": to_node, "edge_type": edge_type, "env": env, "source": source, "first_seen": first_seen, "last_seen": last_seen, "confidence": confidence, "evidence_refs": json_dumps(ev_refs or [edge_id]), "properties": json_dumps(jsonable(props or {}))})
 
     if repo_inventory is not None and not repo_inventory.empty:
         for _, r in repo_inventory.iterrows():
@@ -52,21 +71,21 @@ def build_graph(
             add_edge(svc, eid, "EXPOSES_ENDPOINT", str(ep.get("source")), float(ep.get("confidence") or 0.5))
     if static_edges is not None and not static_edges.empty:
         for _, e in static_edges.iterrows():
-            from_node = canonicalize(str(e.get("from_entity") or ""), aliases)
+            from_node = canon(str(e.get("from_entity") or ""))
             if from_node.startswith("repo:"):
                 # Repo-scoped static edge; keep as repo unless identity maps it later.
                 pass
-            to_node = canonicalize(str(e.get("to_entity") or ""), aliases)
+            to_node = canon(str(e.get("to_entity") or ""))
             ev_id = stable_id("evidence", e.get("edge_id"), e.get("file_path"), e.get("raw_match"))
             evidence.append({"evidence_id": ev_id, "evidence_type": "static", "source_system": e.get("source"), "source_ref": e.get("edge_id"), "repo_id": e.get("repo_id"), "file_path": e.get("file_path"), "line_start": e.get("line_start"), "line_end": e.get("line_end"), "raw_excerpt": e.get("raw_match"), "observed_at": now_iso(), "confidence": e.get("confidence")})
             add_edge(from_node, to_node, str(e.get("edge_type")), str(e.get("source")), float(e.get("confidence") or 0.3), ev_refs=[ev_id], props={"file_path": e.get("file_path"), "line": e.get("line_start")})
     if runtime_service_edges is not None and not runtime_service_edges.empty:
         for _, e in runtime_service_edges.iterrows():
-            from_node = canonicalize(str(e.get("from_service") or ""), aliases)
+            from_node = canon(str(e.get("from_service") or ""))
             if not from_node.startswith("service:"):
                 from_node = f"service:{from_node}"
             to_raw = str(e.get("to_entity") or "")
-            to_node = canonicalize(to_raw, aliases)
+            to_node = canon(to_raw)
             if not any(to_node.startswith(p) for p in ["service:", "bq_table:", "topic:", "database:", "host:"]):
                 typ = str(e.get("to_type") or "entity")
                 to_node = f"{typ}:{to_node}"
@@ -78,7 +97,7 @@ def build_graph(
             if not str(u.get("referenced_table") or ""):
                 continue
             principal = str(u.get("service_account") or u.get("principal_email") or "")
-            from_node = canonicalize(principal, aliases)
+            from_node = canon(principal)
             if not from_node.startswith("service:"):
                 from_node = f"principal:{principal}"
             table_node = f"bq_table:{u.get('referenced_table')}"
@@ -90,6 +109,69 @@ def build_graph(
                 dest_node = f"bq_table:{u.get('destination_table')}"
                 add_node(dest_node, "bq_table", str(u.get("destination_table")), "bigquery", 0.8)
                 add_edge(table_node, dest_node, "LINEAGE_READS_TO_WRITES", "bigquery", 0.75, ev_refs=[ev_id])
+    if code_graph_symbols is not None and not code_graph_symbols.empty:
+        for _, s in code_graph_symbols.iterrows():
+            symbol_id = str(s.get("symbol_id") or "")
+            if not symbol_id:
+                continue
+            display = str(s.get("name") or s.get("rel_path") or symbol_id)
+            add_node(
+                symbol_id,
+                "code_symbol",
+                display,
+                "cgc",
+                0.85,
+                {
+                    "repo_id": s.get("repo_id"),
+                    "symbol_type": s.get("node_type"),
+                    "file_path": s.get("file_path"),
+                    "rel_path": s.get("rel_path"),
+                    "line_start": s.get("line_start"),
+                    "line_end": s.get("line_end"),
+                    "language": s.get("language"),
+                    "signature": s.get("signature"),
+                },
+            )
+            if str(s.get("repo_id") or ""):
+                add_edge(f"repo:{s.get('repo_id')}", symbol_id, "CONTAINS_CODE_SYMBOL", "cgc", 0.85)
+    if code_graph_edges is not None and not code_graph_edges.empty:
+        for _, e in code_graph_edges.iterrows():
+            from_node = str(e.get("from_symbol_id") or "")
+            to_node = str(e.get("to_symbol_id") or "")
+            if not from_node or not to_node:
+                continue
+            ev_id = stable_id("cgc_evidence", e.get("edge_id"), e.get("file_path"), e.get("line_start"))
+            evidence.append({
+                "evidence_id": ev_id,
+                "evidence_type": "code_graph",
+                "source_system": "cgc",
+                "source_ref": e.get("edge_id"),
+                "repo_id": e.get("repo_id"),
+                "file_path": e.get("file_path"),
+                "line_start": e.get("line_start"),
+                "line_end": e.get("line_start"),
+                "raw_excerpt": e.get("properties"),
+                "observed_at": now_iso(),
+                "confidence": e.get("confidence"),
+            })
+            add_edge(
+                from_node,
+                to_node,
+                str(e.get("edge_type") or "CODE_RELATES_TO"),
+                "cgc",
+                float(e.get("confidence") or 0.85),
+                props={"repo_id": e.get("repo_id"), "file_path": e.get("file_path"), "rel_path": e.get("rel_path"), "line_start": e.get("line_start")},
+                ev_refs=[ev_id],
+                edge_id_override=str(e.get("edge_id") or ""),
+            )
+    known_nodes = {str(n.get("node_id") or "") for n in nodes}
+    for e in list(edges):
+        for endpoint_key in ["from_node", "to_node"]:
+            node_id = str(e.get(endpoint_key) or "")
+            if not node_id or node_id in known_nodes:
+                continue
+            add_node(node_id, infer_node_type(node_id), node_id, "edge_endpoint", 0.3, {"inferred_from_edge": e.get("edge_id")})
+            known_nodes.add(node_id)
     return dedupe(pd.DataFrame(nodes), ["node_id"]), dedupe(pd.DataFrame(edges), ["edge_id"]), dedupe(pd.DataFrame(evidence), ["evidence_id"])
 
 
@@ -97,3 +179,27 @@ def dedupe(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     if df.empty:
         return df
     return df.drop_duplicates(subset=keys, keep="first")
+
+
+def jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [jsonable(v) for v in value]
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def infer_node_type(node_id: str) -> str:
+    if ":" in node_id:
+        return node_id.split(":", 1)[0]
+    return "entity"

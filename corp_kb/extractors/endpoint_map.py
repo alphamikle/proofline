@@ -41,16 +41,23 @@ def build_endpoint_dependency_map(api_endpoints: pd.DataFrame, runtime_endpoint_
     # This is intentionally conservative: it tells the agent static dependency exists but does not overclaim exact endpoint usage.
     if static_edges is not None and not static_edges.empty:
         service_by_repo = {str(s.get("repo_id")): str(s.get("service_id")) for _, s in service_identity.iterrows()} if service_identity is not None and not service_identity.empty else {}
-        for _, se in static_edges.iterrows():
-            repo_id = str(se.get("repo_id") or "")
-            service_id = service_by_repo.get(repo_id, repo_id)
-            if not service_id:
-                continue
-            eps = api_endpoints[api_endpoints["service_id"] == service_id]
-            if eps.empty:
-                continue
-            # Only attach high-signal static edges to endpoints as service-level/static-only possible dependencies.
-            if str(se.get("edge_type")) not in {"REFERENCES_URL", "USES_CONFIG_KEY", "REFERENCES_HOST", "REFERENCES_BQ_TABLE", "REFERENCES_TOPIC"}:
+        eps_by_service = {str(service_id): eps for service_id, eps in api_endpoints.groupby("service_id", dropna=False)}
+        allowed_static = {"REFERENCES_URL", "USES_CONFIG_KEY", "REFERENCES_HOST", "REFERENCES_BQ_TABLE", "REFERENCES_TOPIC"}
+        static = static_edges[static_edges["edge_type"].isin(allowed_static)].copy()
+        if not static.empty:
+            static["service_id"] = static["repo_id"].apply(lambda repo_id: service_by_repo.get(str(repo_id), str(repo_id)))
+            static = static[static["service_id"].fillna("") != ""]
+            static = static.groupby(["service_id", "to_entity", "edge_type"], dropna=False).agg(
+                repo_id=("repo_id", "first"),
+                source=("source", "first"),
+                confidence=("confidence", "max"),
+                edge_ids=("edge_id", lambda x: json_dumps(list(dict.fromkeys(str(v) for v in x if str(v)))[:20])),
+                static_evidence_count=("edge_id", "count"),
+            ).reset_index()
+        for _, se in static.iterrows() if not static.empty else []:
+            service_id = str(se.get("service_id") or "")
+            eps = eps_by_service.get(service_id)
+            if eps is None or eps.empty:
                 continue
             for _, ep in eps.iterrows():
                 endpoint_id = f"endpoint:{service_id}:{ep.get('method')}:{ep.get('path')}"
@@ -67,11 +74,11 @@ def build_endpoint_dependency_map(api_endpoints: pd.DataFrame, runtime_endpoint_
                     "runtime_count_30d": None,
                     "p95_ms": None,
                     "error_rate": None,
-                    "static_evidence_count": 1,
+                    "static_evidence_count": int(se.get("static_evidence_count") or 1),
                     "runtime_evidence_count": 0,
                     "sources": json_dumps([se.get("source")]),
                     "confidence": min(float(se.get("confidence") or 0.3), 0.4),
-                    "evidence_refs": json_dumps([se.get("edge_id")]),
+                    "evidence_refs": str(se.get("edge_ids") or "[]"),
                 })
     df = pd.DataFrame(rows)
     if df.empty:

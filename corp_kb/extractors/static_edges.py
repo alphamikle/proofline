@@ -13,7 +13,8 @@ from corp_kb.utils import safe_read_text, stable_id, normalize_name
 URL_RE = re.compile(r"https?://[A-Za-z0-9_.:/\-{}$]+")
 HOST_RE = re.compile(r"\b([a-z0-9][a-z0-9-]+(?:\.[a-z0-9][a-z0-9-]+){1,})(?::\d+)?\b", re.I)
 ENV_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,}(?:URL|URI|HOST|SERVICE|TOPIC|QUEUE|TABLE|DATASET|DATABASE|DB))\b")
-BQ_TABLE_RE = re.compile(r"`?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)`?")
+BQ_BACKTICK_TABLE_RE = re.compile(r"`([a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)`")
+BQ_SQL_TABLE_RE = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE|MERGE\s+INTO)\s+`?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)`?", re.I)
 TOPIC_RE = re.compile(r"\b([a-z][a-z0-9_.\-]+\.(?:events?|commands?|topic|queue)\.?[a-z0-9_.\-]*)\b")
 INTERNAL_PACKAGE_RE = re.compile(r"(@[A-Za-z0-9_.\-/]+/[A-Za-z0-9_.\-/]+|com\.[A-Za-z0-9_.\-]+|[A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+)")
 
@@ -33,7 +34,8 @@ def extract_static_edges(repo_inventory: pd.DataFrame, repo_files: pd.DataFrame)
         if kind == "manifest":
             edges.extend(parse_manifest(repo_id, from_entity, rel, text))
         if kind in {"deploy_config", "source", "source_route_hint", "manifest", "dockerfile", "api_contract"}:
-            edges.extend(parse_refs(repo_id, from_entity, rel, text))
+            include_hosts = kind not in {"source", "source_route_hint"}
+            edges.extend(parse_refs(repo_id, from_entity, rel, text, include_hosts=include_hosts))
     return pd.DataFrame(edges)
 
 
@@ -84,20 +86,30 @@ def parse_manifest(repo_id: str, from_entity: str, rel: str, text: str) -> List[
     return out
 
 
-def parse_refs(repo_id: str, from_entity: str, rel: str, text: str) -> List[Dict[str, Any]]:
+def parse_refs(repo_id: str, from_entity: str, rel: str, text: str, include_hosts: bool = True) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for m in URL_RE.finditer(text):
-        out.append(edge(repo_id, from_entity, f"url:{m.group(0)}", "REFERENCES_URL", "regex_url", rel, m.group(0), line_no(text, m.start()), 0.45))
+    if "http://" in text or "https://" in text:
+        for m in URL_RE.finditer(text):
+            out.append(edge(repo_id, from_entity, f"url:{m.group(0)}", "REFERENCES_URL", "regex_url", rel, m.group(0), line_no(text, m.start()), 0.45))
     for m in ENV_RE.finditer(text):
         out.append(edge(repo_id, from_entity, f"config:{m.group(1)}", "USES_CONFIG_KEY", "regex_env", rel, m.group(1), line_no(text, m.start()), 0.4))
-    for m in BQ_TABLE_RE.finditer(text):
-        out.append(edge(repo_id, from_entity, f"bq_table:{m.group(1)}", "REFERENCES_BQ_TABLE", "regex_bq_table", rel, m.group(1), line_no(text, m.start()), 0.45))
-    for m in TOPIC_RE.finditer(text):
-        out.append(edge(repo_id, from_entity, f"topic:{m.group(1)}", "REFERENCES_TOPIC", "regex_topic", rel, m.group(1), line_no(text, m.start()), 0.35))
-    # Hostnames are noisy; use lower confidence and skip common public domains.
-    for m in HOST_RE.finditer(text):
-        host = m.group(1)
-        if any(host.endswith(x) for x in ["github.com", "google.com", "w3.org", "schema.org", "npmjs.com"]):
-            continue
-        out.append(edge(repo_id, from_entity, f"host:{host}", "REFERENCES_HOST", "regex_host", rel, host, line_no(text, m.start()), 0.25))
+    if "." in text:
+        seen_bq = set()
+        for pat in (BQ_BACKTICK_TABLE_RE, BQ_SQL_TABLE_RE):
+            for m in pat.finditer(text):
+                table = m.group(1)
+                if table in seen_bq:
+                    continue
+                seen_bq.add(table)
+                out.append(edge(repo_id, from_entity, f"bq_table:{table}", "REFERENCES_BQ_TABLE", "regex_bq_table", rel, table, line_no(text, m.start()), 0.45))
+        for m in TOPIC_RE.finditer(text):
+            out.append(edge(repo_id, from_entity, f"topic:{m.group(1)}", "REFERENCES_TOPIC", "regex_topic", rel, m.group(1), line_no(text, m.start()), 0.35))
+    # Hostnames are noisy and expensive in source files; keep them to config-like
+    # surfaces where they are more likely to represent real dependencies.
+    if include_hosts and "." in text:
+        for m in HOST_RE.finditer(text):
+            host = m.group(1)
+            if any(host.endswith(x) for x in ["github.com", "google.com", "w3.org", "schema.org", "npmjs.com"]):
+                continue
+            out.append(edge(repo_id, from_entity, f"host:{host}", "REFERENCES_HOST", "regex_host", rel, host, line_no(text, m.start()), 0.25))
     return out

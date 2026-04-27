@@ -18,7 +18,7 @@ EXT_LANG = {
     ".rs": "rust", ".scala": "scala", ".swift": "swift", ".m": "objective-c", ".h": "c/c++", ".cpp": "c++",
     ".c": "c", ".sql": "sql", ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".toml": "toml",
     ".xml": "xml", ".gradle": "gradle", ".proto": "protobuf", ".graphql": "graphql", ".md": "markdown",
-    ".tf": "terraform", ".sh": "shell",
+    ".tf": "terraform", ".sh": "shell", ".dart": "dart",
 }
 
 MANIFEST_NAMES = {
@@ -31,15 +31,21 @@ K8S_MARKERS = ["deployment", "service", "ingress", "statefulset", "daemonset", "
 ROUTE_FILE_HINTS = ["controller", "routes", "router", "handler", "api"]
 
 
-def find_git_repos(root: Path) -> List[Path]:
-    repos = []
-    for git_dir in root.rglob(".git"):
-        if git_dir.is_dir():
-            repo = git_dir.parent
-            # Avoid nested repos being counted twice under parent .git worktrees.
-            repos.append(repo)
-    repos = sorted(set(repos), key=lambda p: str(p).lower())
-    return repos
+def find_git_repos(root: Path, exclude_dirs: Iterable[str] = ()) -> List[Path]:
+    repos: List[Path] = []
+    excludes = set(exclude_dirs)
+    for dirpath, dirnames, _ in os.walk(root):
+        if ".git" in dirnames:
+            repos.append(Path(dirpath))
+            # A discovered repo can contain large dependency/build trees. The
+            # file scanner will handle this repo later with its own excludes.
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in excludes and d not in {".git", ".hg", ".svn"}
+        ]
+    return sorted(set(repos), key=lambda p: str(p).lower())
 
 
 def repo_id_from_path(repo: Path) -> str:
@@ -230,7 +236,7 @@ def extract_git_history(repo: Path, repo_id: str, limit: int = 200) -> List[Dict
 
 def scan_all_repos(cfg: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     root = Path(cfg["repos"]["root"])
-    repos = find_git_repos(root)
+    repos = find_git_repos(root, cfg["repos"].get("exclude_dirs", []))
     inventories: List[Dict[str, Any]] = []
     files: List[Dict[str, Any]] = []
     ownership: List[Dict[str, Any]] = []

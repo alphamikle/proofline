@@ -40,7 +40,7 @@ cd corp-kb-poc
 ./scripts/bootstrap.sh
 ```
 
-Manual setup:
+Manual Python-only setup:
 
 ```bash
 python3 -m venv .venv
@@ -49,13 +49,13 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-Optional embedding dependencies:
+Full setup also runs the CodeGraphContext installer from `/Users/alfa/dev/code/infra/cgc.sh`:
 
 ```bash
-INSTALL_OPTIONAL=1 ./scripts/bootstrap.sh
+./scripts/bootstrap.sh
 ```
 
-The current version keeps a local vector index as an optional extension. The default retrieval path is graph retrieval, SQLite FTS, and DuckDB SQL.
+This installs local Qwen/SentenceTransformers, FAISS, Neo4j Python client, CodeGraphContext, the broad SCIP indexer stack, and starts the local Neo4j Docker container used by CGC. The SCIP stack includes Python, TypeScript/JavaScript, Go, Rust, Java/Scala/Kotlin, C/C++/CUDA, Ruby, C#/Visual Basic, Dart, and PHP where the current platform supports the indexer binaries. The runtime stages are still controlled through `config.yaml`, so you can keep Qwen embeddings, reranking, Neo4j export, or CodeGraphContext disabled while the tooling remains available.
 
 ## Input preparation
 
@@ -99,6 +99,30 @@ gcloud auth application-default login
 export GOOGLE_CLOUD_PROJECT=your-bq-project
 ```
 
+Atlassian credentials:
+
+```bash
+export ATLASSIAN_EMAIL=you@company.com
+export ATLASSIAN_API_TOKEN=...
+export CONFLUENCE_BASE_URL=https://your-company.atlassian.net/wiki
+export JIRA_BASE_URL=https://your-company.atlassian.net
+```
+
+For Server/Data Center or OAuth-style setups, use:
+
+```bash
+export ATLASSIAN_BEARER_TOKEN=...
+```
+
+Mirror Confluence and Jira locally before indexing:
+
+```bash
+make confluence
+make jira
+```
+
+Confluence stores pages/blogposts, storage/view HTML bodies, comments, attachment metadata, and attachment files under `data/raw/confluence`. Jira stores issues, comments, changelogs, worklogs, remote links, issue properties, attachments, and site metadata under `data/raw/jira`.
+
 ## Run the full pipeline
 
 ```bash
@@ -123,7 +147,9 @@ Pipeline stages:
 ```text
 repo_ingest
 code_index
+embeddings
 api_surface
+code_graph
 static_edges
 datadog
 bigquery
@@ -131,7 +157,46 @@ entity_resolution
 graph
 endpoint_map
 capabilities
+neo4j_export
 smoke
+```
+
+Qwen/FAISS semantic retrieval:
+
+```yaml
+indexing:
+  embeddings:
+    enabled: true
+    model_name: Qwen/Qwen3-Embedding-0.6B
+    max_chunks: 10000   # recommended for first dry run
+retrieval:
+  reranker:
+    enabled: true
+    model_name: Qwen/Qwen3-Reranker-0.6B
+```
+
+Build only the vector index:
+
+```bash
+./run.sh --from-stage embeddings --to-stage embeddings
+```
+
+Neo4j projection:
+
+```yaml
+neo4j:
+  enabled: true
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: codegraphcontext
+```
+
+CodeGraphContext hook:
+
+```yaml
+code_graph:
+  enabled: true
+  command: "$HOME/.local/bin/cgc index {repo_path}"
 ```
 
 ## Quick smoke checks
@@ -198,15 +263,47 @@ Raw context pack instead of a markdown answer:
 
 By default, `agent.provider: none`, so `ask.sh` generates a deterministic markdown report from graph facts.
 
-You can connect any corporate-approved LLM CLI through stdin/stdout:
+For a local model or any corporate-approved CLI, use `provider: cli`; the command receives the full prompt on stdin and should write the answer to stdout:
 
 ```yaml
 agent:
-  provider: command
-  command: "llm -m your-corporate-model"
+  provider: cli
+  command: "ollama run qwen2.5-coder:32b"
 ```
 
-The script sends a compact JSON context pack and system rules to the LLM. The rules instruct the model to avoid unsupported facts and to separate runtime, static, BigQuery/data, and ownership evidence.
+HTTP providers are also supported:
+
+```yaml
+agent:
+  provider: openai              # OpenAI Responses API
+  model: gpt-5.2
+  api_key_env: OPENAI_API_KEY
+```
+
+```yaml
+agent:
+  provider: openai_compatible   # /v1/chat/completions, for local/corporate gateways
+  model: qwen2.5-coder:32b
+  base_url: http://localhost:11434/v1
+  api_key_env: ""
+```
+
+```yaml
+agent:
+  provider: anthropic           # Anthropic Messages API
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+```
+
+```yaml
+agent:
+  provider: anthropic_compatible # /v1/messages, for Claude-compatible gateways
+  model: your-corporate-model
+  base_url: https://llm-gateway.example.com/v1
+  api_key_env: ANTHROPIC_API_KEY
+```
+
+The script sends a compact JSON context pack and system rules to the LLM. The rules instruct the model to avoid unsupported facts and to separate runtime, static, BigQuery/data, and ownership evidence. `agent.enrichment.model` is reserved for offline enrichment stages: for example, summarizing Confluence pages, extracting Jira feature ownership, or normalizing service names before the answer-time agent runs.
 
 ## Output locations
 
@@ -214,8 +311,12 @@ The script sends a compact JSON context pack and system rules to the LLM. The ru
 data/
   kb.duckdb                         # main local database
   indexes/code_fts.sqlite           # FTS index over chunks
+  indexes/code_vectors.faiss        # FAISS vector index when embeddings are enabled
+  indexes/code_vectors_meta.parquet # FAISS id -> chunk metadata
   raw/datadog/...                   # raw-ish Datadog extracts when enabled
   raw/bigquery/...                  # raw-ish BigQuery extracts when enabled
+  raw/confluence/...                # mirrored Confluence content and files
+  raw/jira/...                      # mirrored Jira issues and files
   reports/                          # reserved for future report exports
 ```
 
@@ -225,6 +326,7 @@ Main tables:
 repo_inventory
 repo_files
 code_chunks
+code_embedding_index
 api_contracts
 api_endpoints
 static_edges
@@ -245,6 +347,8 @@ evidence
 endpoint_dependency_map
 data_capabilities
 compatibility_index
+code_graph_runs
+neo4j_exports
 ```
 
 ## Confidence interpretation

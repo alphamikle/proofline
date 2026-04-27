@@ -1,39 +1,48 @@
 from __future__ import annotations
 
-import subprocess
 from typing import Any, Dict, List
 
+from corp_kb.agent.providers import AgentProviderError, complete_with_agent
 from corp_kb.utils import json_dumps
 
 SYSTEM_RULES = """
 You are an engineering LLM agent operating over a local evidence-backed knowledge graph.
 Do not add facts without evidence. If evidence is weak, use likely, inferred, or unknown.
-Always separate runtime evidence, static evidence, BigQuery/data evidence, and ownership evidence.
+Always separate runtime evidence, static evidence, code-graph evidence from CGC/Neo4j, BigQuery/data evidence, and ownership evidence.
+Use code_graph and graph_neighborhood sections to reason about files, symbols, calls, imports, inheritance, and blast radius.
 Answer in a structured engineering style with risks, unknowns, and recommendations.
 """.strip()
 
 
 def maybe_llm_answer(context: Dict[str, Any], cfg: Dict[str, Any]) -> str | None:
-    agent = cfg.get("agent", {})
-    provider = agent.get("provider", "none")
-    if provider != "command" or not agent.get("command"):
-        return None
-    prompt = SYSTEM_RULES + "\n\nCONTEXT JSON:\n" + json_dumps(context)
+    agent_cfg = cfg.get("agent", {})
+    max_chars = int(agent_cfg.get("max_context_chars") or 100000)
+    context_json = json_dumps(_compact_context(context))
+    if len(context_json) > max_chars:
+        context_json = context_json[:max_chars] + "\n...[context truncated]"
+    user_prompt = "CONTEXT JSON:\n" + context_json
     try:
-        p = subprocess.run(
-            agent["command"],
-            input=prompt,
-            shell=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=600,
-        )
-        if p.returncode == 0 and p.stdout.strip():
-            return p.stdout.strip()
-        return None
+        return complete_with_agent(SYSTEM_RULES, user_prompt, cfg)
+    except AgentProviderError:
+        raise
     except Exception:
         return None
+
+
+def _compact_context(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return str(value)[:500]
+    if isinstance(value, list):
+        limit = 25
+        items = [_compact_context(item, depth + 1) for item in value[:limit]]
+        if len(value) > limit:
+            items.append({"_truncated_items": len(value) - limit})
+        return items
+    if isinstance(value, dict):
+        return {str(k): _compact_context(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, str):
+        return value if len(value) <= 2000 else value[:2000] + "...[truncated]"
+    return value
 
 
 def render_markdown(context: Dict[str, Any]) -> str:
@@ -65,12 +74,15 @@ def render_impact(ctx: Dict[str, Any]) -> str:
     dependents = ctx.get("dependents", [])
     bq = ctx.get("bq_usage", [])
     code_hits = ctx.get("code_hits", [])
+    code_graph = ctx.get("code_graph", {})
     caps = ctx.get("capabilities", [])
     out.append(
         f"\n## Summary\n"
         f"- Downstream dependencies: {len(deps)}\n"
         f"- Upstream/runtime dependents: {len(dependents)}\n"
         f"- BigQuery usage rows linked to service: {len(bq)}\n"
+        f"- Code graph symbols: {len(code_graph.get('symbols', [])) if isinstance(code_graph, dict) else 0}\n"
+        f"- Code graph relationships: {len(code_graph.get('relationships', [])) if isinstance(code_graph, dict) else 0}\n"
         f"- Code/doc hits for feature text: {len(code_hits)}\n"
         f"- Capability matches: {len(caps)}"
     )
@@ -85,6 +97,8 @@ def render_impact(ctx: Dict[str, Any]) -> str:
     out.append("- Static clients: generated clients, strict deserialization, DTO/schema imports.")
     out.append("\n## Code/doc search hits")
     out.extend(render_code_hits(code_hits[:10]))
+    out.append("\n## Code graph hits")
+    out.extend(render_code_graph(ctx.get("code_graph", {})))
     out.append("\n## Unknowns")
     out.append("- No concrete diff was provided. For precise breaking-change analysis, pass a branch, PR, diff, or affected files.")
     out.append("- Low-confidence or static-only dependencies should be checked with the relevant owners.")
@@ -127,11 +141,13 @@ def render_dependency_report(ctx: Dict[str, Any]) -> str:
     endpoints = (profile.get("endpoints") or [])
     deps = ctx.get("dependencies", [])
     epdeps = ctx.get("endpoint_dependencies", [])
+    code_graph = ctx.get("code_graph", {})
     out.append(
         f"\n## Summary\n"
         f"- Endpoints discovered: {len(endpoints)}\n"
         f"- Service-level dependencies: {len(deps)}\n"
-        f"- Endpoint dependency rows: {len(epdeps)}"
+        f"- Endpoint dependency rows: {len(epdeps)}\n"
+        f"- Code graph symbols: {len(code_graph.get('symbols', [])) if isinstance(code_graph, dict) else 0}"
     )
     out.append("\n## Service-level dependencies")
     out.extend(render_edge_list(deps[:50], direction="dependency"))
@@ -155,6 +171,8 @@ def render_dependency_report(ctx: Dict[str, Any]) -> str:
             )
     out.append("\n## Simplification candidates")
     out.extend(render_simplification_candidates(epdeps, deps))
+    out.append("\n## Code graph context")
+    out.extend(render_code_graph(ctx.get("code_graph", {})))
     return "\n".join(out)
 
 
@@ -189,6 +207,26 @@ def render_code_hits(hits: List[Dict[str, Any]]) -> List[str]:
     for h in hits:
         txt = (h.get("text") or "").strip().replace("\n", " ")[:240]
         out.append(f"- `{h.get('repo_id')}/{h.get('rel_path')}` {h.get('kind')} {h.get('symbol') or ''}: {txt}")
+    return out
+
+
+def render_code_graph(graph: Dict[str, Any]) -> List[str]:
+    if not isinstance(graph, dict):
+        return ["- No code graph data."]
+    symbols = graph.get("symbols") or []
+    rels = graph.get("relationships") or []
+    if not symbols and not rels:
+        return ["- No code graph data."]
+    out = []
+    for s in symbols[:12]:
+        out.append(f"- `{s.get('repo_id')}/{s.get('rel_path')}` {s.get('node_type')} `{s.get('name')}` line={s.get('line_start')}")
+    if rels:
+        out.append("- Relationships:")
+        for r in rels[:20]:
+            out.append(
+                f"- `{r.get('from_name')}` -> `{r.get('to_name')}` ({r.get('edge_type')}, "
+                f"`{r.get('repo_id')}/{r.get('rel_path')}`, line={r.get('line_start')})"
+            )
     return out
 
 

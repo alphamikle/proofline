@@ -1,25 +1,38 @@
-.PHONY: bootstrap full repo code api static datadog bigquery graph endpoint capabilities smoke
+PYTHON ?= .venv/bin/python
+CONFIG ?= config.yaml
+
+.PHONY: bootstrap full repo code embeddings api code-graph static datadog bigquery confluence jira graph endpoint capabilities neo4j smoke
 bootstrap:
 	./scripts/bootstrap.sh
 full:
 	./run.sh
 repo:
-	python3 -m corp_kb.pipeline.runner stage repo_ingest --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage repo_ingest --config $(CONFIG)
 code:
-	python3 -m corp_kb.pipeline.runner stage code_index --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage code_index --config $(CONFIG)
+embeddings:
+	$(PYTHON) -m corp_kb.pipeline.runner stage embeddings --config $(CONFIG)
 api:
-	python3 -m corp_kb.pipeline.runner stage api_surface --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage api_surface --config $(CONFIG)
+code-graph:
+	$(PYTHON) -m corp_kb.pipeline.runner stage code_graph --config $(CONFIG)
 static:
-	python3 -m corp_kb.pipeline.runner stage static_edges --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage static_edges --config $(CONFIG)
 datadog:
-	python3 -m corp_kb.pipeline.runner stage datadog --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage datadog --config $(CONFIG)
 bigquery:
-	python3 -m corp_kb.pipeline.runner stage bigquery --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage bigquery --config $(CONFIG)
+confluence:
+	$(PYTHON) scripts/download_confluence.py --config $(CONFIG)
+jira:
+	$(PYTHON) scripts/download_jira.py --config $(CONFIG)
 graph:
-	python3 -m corp_kb.pipeline.runner stage graph --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage graph --config $(CONFIG)
 endpoint:
-	python3 -m corp_kb.pipeline.runner stage endpoint_map --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage endpoint_map --config $(CONFIG)
 capabilities:
-	python3 -m corp_kb.pipeline.runner stage capabilities --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage capabilities --config $(CONFIG)
+neo4j:
+	$(PYTHON) -m corp_kb.pipeline.runner stage neo4j_export --config $(CONFIG)
 smoke:
-	python3 -m corp_kb.pipeline.runner stage smoke --config $${CONFIG:-config.yaml}
+	$(PYTHON) -m corp_kb.pipeline.runner stage smoke --config $(CONFIG)

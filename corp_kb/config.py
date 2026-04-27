@@ -44,6 +44,8 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     cfg.setdefault("storage", {})
     cfg["storage"].setdefault("duckdb_path", str(root / "kb.duckdb"))
     cfg["storage"].setdefault("sqlite_fts_path", str(root / "indexes" / "code_fts.sqlite"))
+    cfg["storage"].setdefault("vector_index_path", str(root / "indexes" / "code_vectors.faiss"))
+    cfg["storage"].setdefault("vector_meta_path", str(root / "indexes" / "code_vectors_meta.parquet"))
     cfg.setdefault("repos", {})
     cfg["repos"].setdefault("root", "./repos")
     return cfg
@@ -57,6 +59,8 @@ def ensure_dirs(cfg: Dict[str, Any]) -> None:
         root / "raw" / "datadog" / "logs",
         root / "raw" / "datadog" / "spans",
         root / "raw" / "bigquery",
+        root / "raw" / "confluence",
+        root / "raw" / "jira",
         root / "normalized",
         root / "indexes",
         root / "reports",

@@ -18,7 +18,7 @@ def tools_for(config: str):
     cfg = load_config(config)
     ensure_dirs(cfg)
     kb = KB(cfg["storage"]["duckdb_path"])
-    tools = KBTools(kb, cfg["storage"].get("sqlite_fts_path"))
+    tools = KBTools(kb, cfg["storage"].get("sqlite_fts_path"), cfg)
     return cfg, kb, tools
 
 
@@ -76,6 +76,7 @@ def extract_project_feature(question: str) -> tuple[str, str]:
 def build_impact_context(tools: KBTools, project: str, feature: str, env: str, window_days: int) -> Dict[str, Any]:
     resolved = tools.resolve_project(project)
     sid = ((resolved.get("service") or {}).get("service_id") if resolved.get("found") else project)
+    repo_id = (resolved.get("service") or {}).get("repo_id") if resolved.get("found") else None
     return {
         "question_type": "impact_analysis",
         "project_name": project,
@@ -88,9 +89,12 @@ def build_impact_context(tools: KBTools, project: str, feature: str, env: str, w
         "dependents": tools.get_service_dependents(sid, env, window_days),
         "bq_usage": tools.get_bq_usage(sid, window_days),
         "capabilities": tools.search_capabilities(feature, limit=30),
+        "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=150),
+        "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=150) if repo_id else {},
+        "code_graph": tools.search_code_graph(feature, repo_id=repo_id, limit=40),
         "code_hits": tools.search_code(
             feature,
-            repo_id=(resolved.get("service") or {}).get("repo_id") if resolved.get("found") else None,
+            repo_id=repo_id,
             limit=30,
         ),
     }
@@ -99,6 +103,7 @@ def build_impact_context(tools: KBTools, project: str, feature: str, env: str, w
 def build_data_source_context(tools: KBTools, project: str, feature: str, env: str, window_days: int) -> Dict[str, Any]:
     resolved = tools.resolve_project(project)
     sid = ((resolved.get("service") or {}).get("service_id") if resolved.get("found") else project)
+    repo_id = (resolved.get("service") or {}).get("repo_id") if resolved.get("found") else None
     return {
         "question_type": "data_source_recommendation",
         "project_name": project,
@@ -109,6 +114,8 @@ def build_data_source_context(tools: KBTools, project: str, feature: str, env: s
         "profile": tools.get_service_profile(sid),
         "capabilities": tools.search_capabilities(feature, limit=50),
         "dependencies": tools.get_service_dependencies(sid, env, window_days),
+        "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=150),
+        "code_graph": tools.search_code_graph(feature, repo_id=repo_id, limit=40),
         "code_hits": tools.search_code(feature, repo_id=None, limit=30),
     }
 
@@ -116,6 +123,7 @@ def build_data_source_context(tools: KBTools, project: str, feature: str, env: s
 def build_dependency_context(tools: KBTools, project: str, env: str, window_days: int) -> Dict[str, Any]:
     resolved = tools.resolve_project(project)
     sid = ((resolved.get("service") or {}).get("service_id") if resolved.get("found") else project)
+    repo_id = (resolved.get("service") or {}).get("repo_id") if resolved.get("found") else None
     return {
         "question_type": "dependency_report",
         "project_name": project,
@@ -127,6 +135,9 @@ def build_dependency_context(tools: KBTools, project: str, env: str, window_days
         "dependents": tools.get_service_dependents(sid, env, window_days),
         "endpoint_dependencies": tools.get_endpoint_dependencies(sid, env, window_days),
         "bq_usage": tools.get_bq_usage(sid, window_days),
+        "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=200),
+        "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=200) if repo_id else {},
+        "code_graph": tools.search_code_graph(project, repo_id=repo_id, limit=50),
     }
 
 
@@ -168,12 +179,18 @@ def ask(
                 raise typer.BadParameter("Could not infer the project. Pass --project.")
             ctx = build_impact_context(tools, p, f, env, window_days)
         else:
+            resolved = tools.resolve_project(p) if p else {}
+            repo_id = (resolved.get("service") or {}).get("repo_id") if resolved.get("found") else None
+            sid = (resolved.get("service") or {}).get("service_id") if resolved.get("found") else ""
             ctx = {
                 "question_type": "generic",
                 "question": question,
-                "project": tools.resolve_project(p) if p else {},
+                "project": resolved,
+                "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=100) if sid else {},
+                "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=100) if repo_id else {},
                 "capabilities": tools.search_capabilities(question, limit=25),
-                "code_hits": tools.search_code(question, limit=25),
+                "code_graph": tools.search_code_graph(question, repo_id=repo_id, limit=40),
+                "code_hits": tools.search_code(question, repo_id=repo_id, limit=25),
             }
         emit_context_or_answer(ctx, cfg, raw_context)
     finally:
@@ -237,13 +254,14 @@ def dependency_report(
 def search(
     query: str = typer.Argument(...),
     config: str = typer.Option("config.yaml", "--config", "-c"),
-    repo: Optional[str] = typer.Option(None, "--repo"),
+    repo: Optional[str] = typer.Option(None, "--repo", "--project", "-p"),
     limit: int = typer.Option(25, "--limit"),
 ):
     cfg, kb, tools = tools_for(config)
     try:
         typer.echo(json_dumps({
             "code_hits": tools.search_code(query, repo_id=repo, limit=limit),
+            "code_graph": tools.search_code_graph(query, repo_id=repo, limit=limit),
             "capabilities": tools.search_capabilities(query, limit=limit),
         }))
     finally:

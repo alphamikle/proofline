@@ -1,11 +1,12 @@
+# yaml-language-server: $schema=./config.schema.json
 workspace: ./data
 repos:
   root: ./repos
   # Optional: if present, pipeline can clone missing repos. One URL per line.
   clone_urls_file: null
-  update_existing: false
+  update_existing: true
   include_git_history_metadata: true
-  max_file_mb: 2
+  max_file_mb: 5
   exclude_dirs:
     - .git
     - node_modules
@@ -13,9 +14,14 @@ repos:
     - dist
     - build
     - target
+    - Pods
     - .venv
     - venv
     - __pycache__
+    - .dart_tool
+    - .gradle
+    - .pub-cache
+    - DerivedData
     - .terraform
     - .next
     - coverage
@@ -56,6 +62,8 @@ repos:
 storage:
   duckdb_path: ./data/kb.duckdb
   sqlite_fts_path: ./data/indexes/code_fts.sqlite
+  vector_index_path: ./data/indexes/code_vectors.faiss
+  vector_meta_path: ./data/indexes/code_vectors_meta.parquet
 
 datadog:
   enabled: true
@@ -103,18 +111,132 @@ bigquery:
   pull_lineage: false     # optional, not implemented by default; placeholder
   max_results: null       # optional limit for dry runs
 
+atlassian:
+  # Cloud auth: email + API token. Server/Data Center can use bearer_token_env.
+  email_env: ATLASSIAN_EMAIL
+  api_token_env: ATLASSIAN_API_TOKEN
+  bearer_token_env: ATLASSIAN_BEARER_TOKEN
+  request_timeout_seconds: 60
+  retry_count: 3
+  retry_sleep_seconds: 5
+
+confluence:
+  enabled: true
+  # Example Cloud URL: https://your-company.atlassian.net/wiki
+  base_url: ${CONFLUENCE_BASE_URL}
+  api_path: /rest/api
+  output_dir: ./data/raw/confluence
+  clean_output: true
+  spaces: []              # empty means all visible spaces
+  content_types: [page, blogpost]
+  cql: ""                 # appended with AND to generated CQL when present
+  page_limit: 100
+  max_items: null
+  expand:
+    - space
+    - version
+    - history
+    - ancestors
+    - metadata.labels
+    - body.storage
+    - body.view
+  include_comments: true
+  include_attachments: true
+  download_attachments: true
+
+jira:
+  enabled: true
+  # Example Cloud URL: https://your-company.atlassian.net
+  base_url: ${JIRA_BASE_URL}
+  api_path: /rest/api/3
+  output_dir: ./data/raw/jira
+  clean_output: true
+  jql: "ORDER BY updated DESC"
+  page_limit: 100
+  max_issues: null
+  fields: ["*all"]
+  expand:
+    - renderedFields
+    - names
+    - schema
+    - operations
+    - editmeta
+    - changelog
+  include_comments: true
+  include_changelog: true
+  include_worklogs: true
+  include_remote_links: true
+  include_issue_properties: true
+  include_attachments: true
+  download_attachments: true
+  download_metadata: true
+
 indexing:
   lexical_fts: true
   embeddings:
-    enabled: false
-    model_name: all-MiniLM-L6-v2
-    batch_size: 32
+    enabled: true
+    provider: sentence_transformers
+    model_name: Qwen/Qwen3-Embedding-0.6B
+    # auto uses MPS/CUDA when available, otherwise CPU.
+    device: auto
+    batch_size: 4
     max_chunks: null
+    min_text_chars: 80
+    max_text_chars: 4096
+    include_kinds: [symbol, doc_section, file_window]
+    exclude_languages: [json]
+    rebuild: false
+    checkpoint_interval_batches: 10
+
+retrieval:
+  fts_top_k: 80
+  vector_top_k: 80
+  rerank_top_k: 40
+  reranker:
+    enabled: true
+    provider: sentence_transformers
+    model_name: Qwen/Qwen3-Reranker-0.6B
+    device: cpu
+    batch_size: 8
+
+neo4j:
+  enabled: true
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: codegraphcontext
+  database: neo4j
+  batch_size: 1000
+  clear_existing: true
+
+code_graph:
+  enabled: true
+  command: "$HOME/.local/bin/cgc index {repo_path}"
+  query_command: "$HOME/.local/bin/cgc"
+  timeout_seconds: 300
+  import:
+    enabled: true
+    page_size: 5000
+    query_timeout_seconds: 300
+    node_types: [File, Function, Class, Module, Struct, Enum]
+    max_symbols: null
+    max_edges: null
+  max_repos: null
 
 agent:
-  provider: none          # none | command
-  command: null           # example: "llm -m claude-3.5-sonnet"
+  provider: none          # none | cli | openai | openai_compatible | anthropic | anthropic_compatible
+  model: null             # example: "gpt-5.2", "claude-sonnet-4-6", "qwen2.5-coder:32b"
+  command: null           # used by provider=cli, example: "ollama run qwen2.5-coder:32b"
+  api_key_env: null       # defaults: OPENAI_API_KEY or ANTHROPIC_API_KEY; "" disables auth header
+  base_url: null          # used by compatible/local gateways, example: "http://localhost:11434/v1"
+  base_url_env: null      # defaults: OPENAI_BASE_URL or ANTHROPIC_BASE_URL; "" disables env lookup
+  anthropic_version: "2023-06-01"
+  temperature: 0
+  max_output_tokens: 4096
+  request_timeout_seconds: 600
   max_context_chars: 100000
   require_evidence: true
   default_env: prod
   default_window_days: 30
+  enrichment:
+    enabled: false
+    model: null           # optional cheaper/faster model for offline metadata extraction/summaries

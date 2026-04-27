@@ -1,0 +1,361 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.local/corp-kb/config.schema.json",
+  "title": "corp-kb configuration",
+  "description": "Configuration for the local corporate knowledge graph pipeline.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "workspace": {
+      "type": "string",
+      "description": "Workspace directory for generated data, indexes, and reports.",
+      "default": "./data"
+    },
+    "repos": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "type": "string",
+          "description": "Directory containing repositories to index.",
+          "default": "./repos"
+        },
+        "clone_urls_file": {
+          "type": ["string", "null"],
+          "description": "Optional file containing one repository clone URL per line."
+        },
+        "update_existing": {
+          "type": "boolean",
+          "description": "Fetch and pull repositories that already exist under repos.root.",
+          "default": true
+        },
+        "include_git_history_metadata": {
+          "type": "boolean",
+          "description": "Collect lightweight Git history metadata during repository scan.",
+          "default": true
+        },
+        "max_file_mb": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Maximum file size, in megabytes, to index.",
+          "default": 5
+        },
+        "exclude_dirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Directory names skipped during repository scan."
+        },
+        "include_extensions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "File extensions or filenames included in code indexing."
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "duckdb_path": { "$ref": "#/definitions/stringPath" },
+        "sqlite_fts_path": { "$ref": "#/definitions/stringPath" },
+        "vector_index_path": { "$ref": "#/definitions/stringPath" },
+        "vector_meta_path": { "$ref": "#/definitions/stringPath" }
+      }
+    },
+    "datadog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "site": {
+          "type": "string",
+          "description": "Datadog site, for example datadoghq.com, datadoghq.eu, us3.datadoghq.com, us5.datadoghq.com, ap1, or ap2.",
+          "default": "datadoghq.com"
+        },
+        "envs": { "$ref": "#/definitions/stringArray" },
+        "windows_days": { "$ref": "#/definitions/positiveIntegerArray" },
+        "service_dependencies": { "type": "boolean", "default": true },
+        "service_definitions": { "type": "boolean", "default": true },
+        "spans": { "$ref": "#/definitions/datadogSearch" },
+        "logs": { "$ref": "#/definitions/datadogSearch" },
+        "field_aliases": {
+          "type": "object",
+          "description": "Maps normalized field names to candidate field paths seen in Datadog payloads.",
+          "additionalProperties": { "$ref": "#/definitions/stringArray" }
+        }
+      }
+    },
+    "bigquery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "project_id": {
+          "type": ["string", "null"],
+          "description": "BigQuery project id. Defaults to GOOGLE_CLOUD_PROJECT when null."
+        },
+        "regions": { "$ref": "#/definitions/stringArray" },
+        "windows_days": { "$ref": "#/definitions/positiveIntegerArray" },
+        "pull_jobs": { "type": "boolean", "default": true },
+        "pull_schemas": { "type": "boolean", "default": true },
+        "pull_lineage": { "type": "boolean", "default": false },
+        "max_results": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional row limit for dry runs."
+        }
+      }
+    },
+    "atlassian": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "email_env": { "type": "string", "default": "ATLASSIAN_EMAIL" },
+        "api_token_env": { "type": "string", "default": "ATLASSIAN_API_TOKEN" },
+        "bearer_token_env": { "type": "string", "default": "ATLASSIAN_BEARER_TOKEN" },
+        "request_timeout_seconds": { "$ref": "#/definitions/positiveInteger" },
+        "retry_count": { "$ref": "#/definitions/nonNegativeInteger" },
+        "retry_sleep_seconds": { "$ref": "#/definitions/nonNegativeInteger" }
+      }
+    },
+    "confluence": {
+      "$ref": "#/definitions/atlassianSource"
+    },
+    "jira": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "base_url": {
+          "type": "string",
+          "description": "Base URL. Environment placeholders such as ${JIRA_BASE_URL} are allowed."
+        },
+        "api_path": { "type": "string", "default": "/rest/api/3" },
+        "output_dir": { "$ref": "#/definitions/stringPath" },
+        "clean_output": { "type": "boolean", "default": true },
+        "jql": { "type": "string", "default": "ORDER BY updated DESC" },
+        "page_limit": { "$ref": "#/definitions/positiveInteger" },
+        "max_issues": { "$ref": "#/definitions/nullablePositiveInteger" },
+        "fields": { "$ref": "#/definitions/stringArray" },
+        "expand": { "$ref": "#/definitions/stringArray" },
+        "include_comments": { "type": "boolean", "default": true },
+        "include_changelog": { "type": "boolean", "default": true },
+        "include_worklogs": { "type": "boolean", "default": true },
+        "include_remote_links": { "type": "boolean", "default": true },
+        "include_issue_properties": { "type": "boolean", "default": true },
+        "include_attachments": { "type": "boolean", "default": true },
+        "download_attachments": { "type": "boolean", "default": true },
+        "download_metadata": { "type": "boolean", "default": true }
+      }
+    },
+    "indexing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "lexical_fts": { "type": "boolean", "default": true },
+        "embeddings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "provider": {
+              "type": "string",
+              "enum": ["sentence_transformers"],
+              "default": "sentence_transformers"
+            },
+            "model_name": { "type": "string" },
+            "device": {
+              "type": "string",
+              "description": "Embedding device: auto, cpu, cuda, mps, or another device string accepted by sentence-transformers.",
+              "default": "auto"
+            },
+            "batch_size": { "$ref": "#/definitions/positiveInteger" },
+            "max_chunks": { "$ref": "#/definitions/nullablePositiveInteger" },
+            "min_text_chars": { "$ref": "#/definitions/nonNegativeInteger" },
+            "max_text_chars": { "$ref": "#/definitions/positiveInteger" },
+            "include_kinds": { "$ref": "#/definitions/stringArray" },
+            "exclude_languages": { "$ref": "#/definitions/stringArray" },
+            "rebuild": { "type": "boolean", "default": false },
+            "checkpoint_interval_batches": { "$ref": "#/definitions/positiveInteger" }
+          }
+        }
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fts_top_k": { "$ref": "#/definitions/positiveInteger" },
+        "vector_top_k": { "$ref": "#/definitions/positiveInteger" },
+        "rerank_top_k": { "$ref": "#/definitions/positiveInteger" },
+        "reranker": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "provider": {
+              "type": "string",
+              "enum": ["sentence_transformers"],
+              "default": "sentence_transformers"
+            },
+            "model_name": { "type": "string" },
+            "device": { "type": "string", "default": "cpu" },
+            "batch_size": { "$ref": "#/definitions/positiveInteger" }
+          }
+        }
+      }
+    },
+    "neo4j": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "uri": { "type": "string", "default": "bolt://localhost:7687" },
+        "username": { "type": "string", "default": "neo4j" },
+        "password": { "type": "string" },
+        "database": { "type": "string", "default": "neo4j" },
+        "batch_size": { "$ref": "#/definitions/positiveInteger" },
+        "clear_existing": { "type": "boolean", "default": true }
+      }
+    },
+    "code_graph": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "command": {
+          "type": "string",
+          "description": "Command template used to index a repository. Supports {repo_path} and {repo_id} placeholders."
+        },
+        "query_command": {
+          "type": "string",
+          "description": "Executable used for CodeGraphContext query commands."
+        },
+        "executable": {
+          "type": "string",
+          "description": "Legacy alias for query_command."
+        },
+        "timeout_seconds": { "$ref": "#/definitions/positiveInteger" },
+        "clear_existing": { "type": "boolean", "default": true },
+        "import": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "page_size": { "$ref": "#/definitions/positiveInteger" },
+            "query_timeout_seconds": { "$ref": "#/definitions/positiveInteger" },
+            "node_types": { "$ref": "#/definitions/stringArray" },
+            "max_symbols": { "$ref": "#/definitions/nullablePositiveInteger" },
+            "max_edges": { "$ref": "#/definitions/nullablePositiveInteger" }
+          }
+        },
+        "max_repos": { "$ref": "#/definitions/nullablePositiveInteger" }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["none", "cli", "openai", "openai_compatible", "anthropic", "anthropic_compatible"],
+          "default": "none"
+        },
+        "model": { "$ref": "#/definitions/nullableString" },
+        "command": { "$ref": "#/definitions/nullableString" },
+        "api_key_env": {
+          "type": ["string", "null"],
+          "description": "Environment variable containing the API key. Empty string disables auth header."
+        },
+        "base_url": { "$ref": "#/definitions/nullableString" },
+        "base_url_env": {
+          "type": ["string", "null"],
+          "description": "Environment variable containing base URL. Empty string disables env lookup."
+        },
+        "anthropic_version": { "type": "string", "default": "2023-06-01" },
+        "temperature": { "type": "number", "minimum": 0 },
+        "max_output_tokens": { "$ref": "#/definitions/positiveInteger" },
+        "request_timeout_seconds": { "$ref": "#/definitions/positiveInteger" },
+        "max_context_chars": { "$ref": "#/definitions/positiveInteger" },
+        "require_evidence": { "type": "boolean", "default": true },
+        "default_env": { "type": "string", "default": "prod" },
+        "default_window_days": { "$ref": "#/definitions/positiveInteger" },
+        "enrichment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "model": {
+              "type": ["string", "null"],
+              "description": "Optional cheaper or faster model for offline metadata extraction and summaries."
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "stringPath": {
+      "type": "string"
+    },
+    "nullableStringPath": {
+      "type": ["string", "null"]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nullablePositiveInteger": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "stringArray": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "positiveIntegerArray": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/positiveInteger" }
+    },
+    "datadogSearch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "query": { "type": "string", "default": "*" },
+        "max_pages_per_window": { "$ref": "#/definitions/positiveInteger" },
+        "page_limit": { "$ref": "#/definitions/positiveInteger" }
+      }
+    },
+    "atlassianSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "base_url": {
+          "type": "string",
+          "description": "Base URL. Environment placeholders such as ${JIRA_BASE_URL} are allowed."
+        },
+        "api_path": { "type": "string" },
+        "output_dir": { "$ref": "#/definitions/stringPath" },
+        "clean_output": { "type": "boolean", "default": true },
+        "spaces": { "$ref": "#/definitions/stringArray" },
+        "content_types": { "$ref": "#/definitions/stringArray" },
+        "cql": { "type": "string" },
+        "page_limit": { "$ref": "#/definitions/positiveInteger" },
+        "max_items": { "$ref": "#/definitions/nullablePositiveInteger" },
+        "expand": { "$ref": "#/definitions/stringArray" },
+        "include_comments": { "type": "boolean", "default": true },
+        "include_attachments": { "type": "boolean", "default": true },
+        "download_attachments": { "type": "boolean", "default": true }
+      }
+    }
+  }
+}

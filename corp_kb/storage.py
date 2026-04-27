@@ -58,6 +58,14 @@ class KB:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS code_embedding_index (
+              faiss_id BIGINT, chunk_id TEXT, repo_id TEXT, rel_path TEXT,
+              language TEXT, kind TEXT, symbol TEXT, start_line INTEGER,
+              end_line INTEGER, text_sha1 TEXT, model_name TEXT, vector_dim INTEGER,
+              embedded_at TEXT
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS api_contracts (
               contract_id TEXT, service_id TEXT, repo_id TEXT, contract_type TEXT,
               source_file TEXT, docs_url TEXT, commit_sha TEXT, confidence DOUBLE
@@ -200,6 +208,34 @@ class KB:
               capability_id TEXT, provider_entity TEXT, capability_name TEXT,
               fields TEXT, access_method TEXT, docs_url TEXT, owner_team TEXT,
               usage_count_30d BIGINT, confidence DOUBLE, evidence_refs TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_graph_runs (
+              repo_id TEXT, repo_path TEXT, status TEXT, started_at TEXT,
+              finished_at TEXT, command TEXT, details TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_graph_symbols (
+              symbol_id TEXT, repo_id TEXT, node_type TEXT, name TEXT,
+              file_path TEXT, rel_path TEXT, line_start INTEGER,
+              line_end INTEGER, language TEXT, signature TEXT,
+              source TEXT, properties TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_graph_edges (
+              edge_id TEXT, repo_id TEXT, from_symbol_id TEXT,
+              to_symbol_id TEXT, edge_type TEXT, file_path TEXT,
+              rel_path TEXT, line_start INTEGER, source TEXT,
+              confidence DOUBLE, properties TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS neo4j_exports (
+              exported_at TEXT, node_count BIGINT, edge_count BIGINT,
+              evidence_count BIGINT, status TEXT, details TEXT
             )
             """,
             """
