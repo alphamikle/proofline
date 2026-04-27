@@ -199,8 +199,9 @@ retrieval:
     device: cpu
     batch_size: 8
 
-neo4j:
+graph_backend:
   enabled: true
+  provider: neo4j
   uri: bolt://localhost:7687
   username: neo4j
   password: codegraphcontext

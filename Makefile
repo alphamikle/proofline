@@ -1,38 +1,38 @@
 PYTHON ?= .venv/bin/python
-CONFIG ?= config.yaml
+CONFIG ?= proofline.yaml
 
-.PHONY: bootstrap full repo code embeddings api code-graph static datadog bigquery confluence jira graph endpoint capabilities neo4j smoke
+.PHONY: bootstrap full repo code embeddings api code-graph static datadog bigquery confluence jira graph endpoint capabilities publish smoke
 bootstrap:
-	./scripts/bootstrap.sh
+	$(PYTHON) -m proofline bootstrap
 full:
-	./run.sh
+	$(PYTHON) -m proofline run --config $(CONFIG)
 repo:
-	$(PYTHON) -m corp_kb.pipeline.runner stage repo_ingest --config $(CONFIG)
+	$(PYTHON) -m proofline stage repos --config $(CONFIG)
 code:
-	$(PYTHON) -m corp_kb.pipeline.runner stage code_index --config $(CONFIG)
+	$(PYTHON) -m proofline build code --config $(CONFIG)
 embeddings:
-	$(PYTHON) -m corp_kb.pipeline.runner stage embeddings --config $(CONFIG)
+	$(PYTHON) -m proofline build embeddings --config $(CONFIG)
 api:
-	$(PYTHON) -m corp_kb.pipeline.runner stage api_surface --config $(CONFIG)
+	$(PYTHON) -m proofline build api --config $(CONFIG)
 code-graph:
-	$(PYTHON) -m corp_kb.pipeline.runner stage code_graph --config $(CONFIG)
+	$(PYTHON) -m proofline build code-graph --config $(CONFIG)
 static:
-	$(PYTHON) -m corp_kb.pipeline.runner stage static_edges --config $(CONFIG)
+	$(PYTHON) -m proofline build static --config $(CONFIG)
 datadog:
-	$(PYTHON) -m corp_kb.pipeline.runner stage datadog --config $(CONFIG)
+	$(PYTHON) -m proofline sync runtime --config $(CONFIG)
 bigquery:
-	$(PYTHON) -m corp_kb.pipeline.runner stage bigquery --config $(CONFIG)
+	$(PYTHON) -m proofline sync data --config $(CONFIG)
 confluence:
 	$(PYTHON) scripts/download_confluence.py --config $(CONFIG)
 jira:
 	$(PYTHON) scripts/download_jira.py --config $(CONFIG)
 graph:
-	$(PYTHON) -m corp_kb.pipeline.runner stage graph --config $(CONFIG)
+	$(PYTHON) -m proofline build graph --config $(CONFIG)
 endpoint:
-	$(PYTHON) -m corp_kb.pipeline.runner stage endpoint_map --config $(CONFIG)
+	$(PYTHON) -m proofline build endpoints --config $(CONFIG)
 capabilities:
-	$(PYTHON) -m corp_kb.pipeline.runner stage capabilities --config $(CONFIG)
-neo4j:
-	$(PYTHON) -m corp_kb.pipeline.runner stage neo4j_export --config $(CONFIG)
+	$(PYTHON) -m proofline build capabilities --config $(CONFIG)
+publish:
+	$(PYTHON) -m proofline publish --config $(CONFIG)
 smoke:
-	$(PYTHON) -m corp_kb.pipeline.runner stage smoke --config $(CONFIG)
+	$(PYTHON) -m proofline stage smoke --config $(CONFIG)

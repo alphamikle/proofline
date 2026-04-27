@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from corp_kb.utils import now_iso
+from proofline.utils import now_iso
 
 
 def text_sha1(text: str) -> str:

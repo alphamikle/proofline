@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import pandas as pd
 
-from corp_kb.utils import now_iso, run_cmd, safe_read_text, stable_id, json_dumps
+from proofline.utils import now_iso, run_cmd, safe_read_text, stable_id, json_dumps
 
 EXT_LANG = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript",

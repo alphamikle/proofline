@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
-from corp_kb.utils import safe_read_text, stable_id, json_dumps
+from proofline.utils import safe_read_text, stable_id, json_dumps
 
 LANG_BY_EXT = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript",

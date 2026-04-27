@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from corp_kb.utils import normalize_name, stable_id, json_dumps
+from proofline.utils import normalize_name, stable_id, json_dumps
 
 
 def build_service_identity(

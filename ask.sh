@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CONFIG=${CONFIG:-config.yaml}
+CONFIG=${CONFIG:-proofline.yaml}
 PYTHON=${PYTHON:-}
 if [[ -z "$PYTHON" ]]; then
   if [[ -x ".venv/bin/python" ]]; then
@@ -20,11 +20,11 @@ EOF
 fi
 cmd=${1:-}
 case "$cmd" in
-  ask|impact|data-source|dependency-report|search)
+  ask|impact|data-source|dependencies|search)
     shift
-    "$PYTHON" -m corp_kb.agent.ask "$cmd" --config "$CONFIG" "$@"
+    "$PYTHON" -m proofline "$cmd" --config "$CONFIG" "$@"
     ;;
   *)
-    "$PYTHON" -m corp_kb.agent.ask ask --config "$CONFIG" "$@"
+    "$PYTHON" -m proofline ask --config "$CONFIG" "$@"
     ;;
 esac

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://example.local/corp-kb/config.schema.json",
-  "title": "corp-kb configuration",
+  "$id": "https://example.local/proofline/config.schema.json",
+  "title": "proofline configuration",
   "description": "Configuration for the local corporate knowledge graph pipeline.",
   "type": "object",
   "additionalProperties": false,
@@ -205,11 +205,12 @@
         }
       }
     },
-    "neo4j": {
+    "graph_backend": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean", "default": true },
+        "provider": { "type": "string", "enum": ["neo4j"], "default": "neo4j" },
         "uri": { "type": "string", "default": "bolt://localhost:7687" },
         "username": { "type": "string", "default": "neo4j" },
         "password": { "type": "string" },

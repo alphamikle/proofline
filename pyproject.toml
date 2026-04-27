@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proofline"
+version = "0.1.0"
+description = "Evidence-backed local knowledge graph CLI."
+requires-python = ">=3.9"
+
+[project.scripts]
+proofline = "proofline.cli:app"
+pfl = "proofline.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["proofline*"]

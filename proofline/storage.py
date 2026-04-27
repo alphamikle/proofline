@@ -233,7 +233,7 @@ class KB:
             )
             """,
             """
-            CREATE TABLE IF NOT EXISTS neo4j_exports (
+            CREATE TABLE IF NOT EXISTS graph_backend_exports (
               exported_at TEXT, node_count BIGINT, edge_count BIGINT,
               evidence_count BIGINT, status TEXT, details TEXT
             )

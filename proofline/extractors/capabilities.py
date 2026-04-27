@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from corp_kb.utils import stable_id, json_dumps
+from proofline.utils import stable_id, json_dumps
 
 
 def build_capabilities(api_endpoints: pd.DataFrame, bq_usage: pd.DataFrame, service_identity: pd.DataFrame) -> pd.DataFrame:

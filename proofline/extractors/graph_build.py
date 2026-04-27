@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from corp_kb.utils import normalize_name
-from corp_kb.utils import stable_id, json_dumps, now_iso
+from proofline.utils import normalize_name
+from proofline.utils import stable_id, json_dumps, now_iso
 
 
 def build_graph(

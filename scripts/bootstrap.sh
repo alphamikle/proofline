@@ -5,13 +5,14 @@ log() {
   printf '\n==> %s\n' "$*"
 }
 
-CGC_BOOTSTRAP_SCRIPT="${CGC_BOOTSTRAP_SCRIPT:-./bootstrap/cgc.sh}"
+CGC_BOOTSTRAP_SCRIPT="${CGC_BOOTSTRAP_SCRIPT:-./scripts/cgc.sh}"
 INSTALL_CGC_STACK="${INSTALL_CGC_STACK:-1}"
 
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+pip install -e .
 
 if [[ "$INSTALL_CGC_STACK" == "1" ]]; then
   if [[ ! -f "$CGC_BOOTSTRAP_SCRIPT" ]]; then
@@ -23,8 +24,8 @@ if [[ "$INSTALL_CGC_STACK" == "1" ]]; then
   bash "$CGC_BOOTSTRAP_SCRIPT"
 fi
 
-if [[ ! -f config.yaml ]]; then
-  cp config.example.yaml config.yaml
-  echo "Created config.yaml from config.example.yaml"
+if [[ ! -f proofline.yaml ]]; then
+  cp proofline.example.yaml proofline.yaml
+  echo "Created proofline.yaml from proofline.example.yaml"
 fi
 mkdir -p repos data

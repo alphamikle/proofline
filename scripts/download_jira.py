@@ -16,8 +16,8 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from corp_kb.config import ensure_dirs, load_config
-from corp_kb.utils import now_iso
+from proofline.config import ensure_dirs, load_config
+from proofline.utils import now_iso
 
 
 def safe_name(value: str) -> str:
@@ -126,7 +126,7 @@ def mirror_jira(config_path: str, dry_run: bool = False) -> None:
     ensure_dirs(cfg)
     jira = cfg.get("jira", {})
     if not jira.get("enabled", False) and not dry_run:
-        raise SystemExit("jira.enabled is false. Enable it in config.yaml or run with --dry-run.")
+        raise SystemExit("jira.enabled is false. Enable it in proofline.yaml or run with --dry-run.")
     out = Path(jira.get("output_dir") or Path(cfg["workspace"]) / "raw" / "jira")
     if dry_run:
         print(json.dumps({"base_url": jira.get("base_url"), "output_dir": str(out), "jql": jira.get("jql")}, indent=2))
@@ -205,8 +205,8 @@ def mirror_jira(config_path: str, dry_run: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Mirror Jira issues locally for corp-kb indexing.")
-    parser.add_argument("--config", "-c", default="config.yaml")
+    parser = argparse.ArgumentParser(description="Mirror Jira issues locally for proofline indexing.")
+    parser.add_argument("--config", "-c", default="proofline.yaml")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     mirror_jira(args.config, args.dry_run)

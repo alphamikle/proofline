@@ -1,34 +1,32 @@
 from __future__ import annotations
 
-import logging
-import shutil
 import subprocess
 from pathlib import Path
-from typing import Callable, Dict, Any, List, Optional
+from typing import Callable, Dict, Any, Optional
 
 import pandas as pd
 import typer
 
-from corp_kb.config import load_config, ensure_dirs
-from corp_kb.logging_utils import setup_logging, log_step, console
-from corp_kb.storage import KB
-from corp_kb.utils import now_iso, json_dumps
-from corp_kb.extractors.repo import scan_all_repos
-from corp_kb.extractors.code_index import build_chunks, build_sqlite_fts
-from corp_kb.extractors.api_surface import parse_api_specs, extract_static_routes
-from corp_kb.extractors.static_edges import extract_static_edges
-from corp_kb.extractors.datadog import pull_service_dependencies, pull_service_definitions, search_spans, search_logs, build_runtime_edges_from_dd
-from corp_kb.extractors.bigquery import pull_bq_jobs, build_table_usage
-from corp_kb.extractors.entity_resolution import build_service_identity
-from corp_kb.extractors.graph_build import build_graph
-from corp_kb.extractors.endpoint_map import build_endpoint_dependency_map
-from corp_kb.extractors.capabilities import build_capabilities
-from corp_kb.extractors.compatibility import build_compatibility_index
-from corp_kb.extractors.embeddings import build_code_embeddings
-from corp_kb.extractors.neo4j_export import export_graph_to_neo4j
-from corp_kb.extractors.code_graph import import_code_graph, run_code_graph_index
+from proofline.config import DEFAULT_CONFIG, load_config, ensure_dirs
+from proofline.logging_utils import setup_logging, log_step, console
+from proofline.storage import KB
+from proofline.utils import now_iso
+from proofline.extractors.repo import scan_all_repos
+from proofline.extractors.code_index import build_chunks, build_sqlite_fts
+from proofline.extractors.api_surface import parse_api_specs, extract_static_routes
+from proofline.extractors.static_edges import extract_static_edges
+from proofline.extractors.datadog import pull_service_dependencies, pull_service_definitions, search_spans, search_logs, build_runtime_edges_from_dd
+from proofline.extractors.bigquery import pull_bq_jobs, build_table_usage
+from proofline.extractors.entity_resolution import build_service_identity
+from proofline.extractors.graph_build import build_graph
+from proofline.extractors.endpoint_map import build_endpoint_dependency_map
+from proofline.extractors.capabilities import build_capabilities
+from proofline.extractors.compatibility import build_compatibility_index
+from proofline.extractors.embeddings import build_code_embeddings
+from proofline.extractors.graph_backend import publish_graph_backend
+from proofline.extractors.code_graph import import_code_graph, run_code_graph_index
 
-app = typer.Typer(help="Local corporate code/runtime/data knowledge graph POC pipeline")
+app = typer.Typer(help="Proofline pipeline")
 
 
 def stage_record(kb: KB, stage: str, started: str, status: str, details: str = "") -> None:
@@ -213,11 +211,11 @@ def stage_capabilities(kb: KB, cfg: Dict[str, Any]) -> None:
     console.print(f"capabilities: {len(caps)}, compatibility risk entities: {len(compat)}")
 
 
-def stage_neo4j_export(kb: KB, cfg: Dict[str, Any]) -> None:
-    result = export_graph_to_neo4j(kb, cfg)
-    kb.append_df("neo4j_exports", result)
+def stage_publish(kb: KB, cfg: Dict[str, Any]) -> None:
+    result = publish_graph_backend(kb, cfg)
+    kb.append_df("graph_backend_exports", result)
     row = result.iloc[0].to_dict() if not result.empty else {}
-    console.print(f"neo4j export: {row.get('status')}, nodes={row.get('node_count')}, edges={row.get('edge_count')}")
+    console.print(f"publish: {row.get('status')}, nodes={row.get('node_count')}, edges={row.get('edge_count')}")
 
 
 def stage_smoke(kb: KB, cfg: Dict[str, Any]) -> None:
@@ -252,38 +250,73 @@ STAGES: Dict[str, Callable[[KB, Dict[str, Any]], None]] = {
     "graph": stage_graph,
     "endpoint_map": stage_endpoint_map,
     "capabilities": stage_capabilities,
-    "neo4j_export": stage_neo4j_export,
+    "publish": stage_publish,
     "smoke": stage_smoke,
 }
 
 FULL_ORDER = [
     "repo_ingest", "code_index", "embeddings", "api_surface", "code_graph", "static_edges", "datadog", "bigquery",
-    "entity_resolution", "graph", "endpoint_map", "capabilities", "neo4j_export", "smoke",
+    "entity_resolution", "graph", "endpoint_map", "capabilities", "publish", "smoke",
 ]
 
+STAGE_ALIASES = {
+    "repos": "repo_ingest",
+    "repo": "repo_ingest",
+    "code": "code_index",
+    "api": "api_surface",
+    "code-graph": "code_graph",
+    "static": "static_edges",
+    "runtime": "datadog",
+    "data": "bigquery",
+    "identity": "entity_resolution",
+    "endpoints": "endpoint_map",
+    "endpoint-map": "endpoint_map",
+    "capability": "capabilities",
+}
 
-@app.command()
-def full(config: str = typer.Option("config.yaml", "--config", "-c"), from_stage: Optional[str] = typer.Option(None), to_stage: Optional[str] = typer.Option(None)):
+
+def resolve_stage(name: str) -> str:
+    normalized = name.strip().replace("-", "_")
+    return STAGE_ALIASES.get(name.strip(), STAGE_ALIASES.get(normalized, normalized))
+
+
+def run_order(
+    config: str = DEFAULT_CONFIG,
+    from_stage: Optional[str] = None,
+    to_stage: Optional[str] = None,
+) -> None:
     setup_logging()
     cfg = load_config(config)
     ensure_dirs(cfg)
     order = FULL_ORDER[:]
     if from_stage:
-        order = order[order.index(from_stage):]
+        start = resolve_stage(from_stage)
+        order = order[order.index(start):]
     if to_stage:
-        order = order[: order.index(to_stage) + 1]
+        end = resolve_stage(to_stage)
+        order = order[: order.index(end) + 1]
     for s in order:
         run_stage(s, cfg, STAGES[s])
 
 
 @app.command()
-def stage(name: str, config: str = typer.Option("config.yaml", "--config", "-c")):
+def full(
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c"),
+    from_stage: Optional[str] = typer.Option(None, "--from"),
+    to_stage: Optional[str] = typer.Option(None, "--to"),
+):
+    run_order(config, from_stage, to_stage)
+
+
+@app.command()
+def stage(name: str, config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c")):
     setup_logging()
     cfg = load_config(config)
     ensure_dirs(cfg)
-    if name not in STAGES:
+    stage_name = resolve_stage(name)
+    if stage_name not in STAGES:
         raise typer.BadParameter(f"Unknown stage: {name}. Known: {', '.join(STAGES)}")
-    run_stage(name, cfg, STAGES[name])
+    run_stage(stage_name, cfg, STAGES[stage_name])
 
 
 if __name__ == "__main__":

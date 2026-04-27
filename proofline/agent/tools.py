@@ -7,9 +7,9 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from corp_kb.storage import KB
-from corp_kb.utils import normalize_name, json_dumps
-from corp_kb.extractors.embeddings import load_sentence_transformer
+from proofline.storage import KB
+from proofline.utils import normalize_name, json_dumps
+from proofline.extractors.embeddings import load_sentence_transformer
 
 
 class KBTools:
@@ -353,9 +353,9 @@ class KBTools:
         return {"symbols": symbols.to_dict("records"), "relationships": edges}
 
     def get_graph_neighborhood(self, node_id: str, limit: int = 100) -> Dict[str, Any]:
-        neo = self._neo4j_neighborhood(node_id, limit)
-        if neo is not None:
-            return {"source": "neo4j", **neo}
+        backend = self._graph_backend_neighborhood(node_id, limit)
+        if backend is not None:
+            return {"source": "graph_backend", **backend}
         rows = self.kb.query_df(
             """
             SELECT * FROM edges
@@ -375,7 +375,7 @@ class KBTools:
             nodes = self.kb.query_df(f"SELECT * FROM nodes WHERE node_id IN ({placeholders})", list(node_ids)).to_dict("records")
         return {"source": "duckdb", "center": node_id, "nodes": nodes, "edges": rows.to_dict("records")}
 
-    def _neo4j_neighborhood(self, node_id: str, limit: int) -> Dict[str, Any] | None:
+    def _graph_backend_neighborhood(self, node_id: str, limit: int) -> Dict[str, Any] | None:
         neo = self.cfg.get("neo4j", {})
         if not neo.get("enabled", False):
             return None

@@ -4,12 +4,12 @@ from typing import Any, Dict, Optional
 
 import typer
 
-from corp_kb.config import load_config, ensure_dirs
-from corp_kb.logging_utils import setup_logging
-from corp_kb.storage import KB
-from corp_kb.agent.tools import KBTools
-from corp_kb.agent.compose import maybe_llm_answer, render_markdown
-from corp_kb.utils import json_dumps
+from proofline.config import DEFAULT_CONFIG, load_config, ensure_dirs
+from proofline.logging_utils import setup_logging
+from proofline.storage import KB
+from proofline.agent.tools import KBTools
+from proofline.agent.compose import maybe_llm_answer, render_markdown
+from proofline.utils import json_dumps
 
 app = typer.Typer(help="Ask the local corporate knowledge graph")
 
@@ -152,7 +152,7 @@ def emit_context_or_answer(ctx: Dict[str, Any], cfg: Dict[str, Any], raw_context
 @app.command("ask")
 def ask(
     question: str = typer.Argument(..., help="Natural language question"),
-    config: str = typer.Option("config.yaml", "--config", "-c"),
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c"),
     project: Optional[str] = typer.Option(None, "--project"),
     env: Optional[str] = typer.Option(None, "--env"),
     window_days: Optional[int] = typer.Option(None, "--window-days"),
@@ -201,7 +201,7 @@ def ask(
 def impact(
     project: str = typer.Option(..., "--project", "-p"),
     feature: str = typer.Option(..., "--feature", "-f"),
-    config: str = typer.Option("config.yaml", "--config", "-c"),
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c"),
     env: Optional[str] = typer.Option(None, "--env"),
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
@@ -219,7 +219,7 @@ def impact(
 def data_source(
     project: str = typer.Option(..., "--project", "-p"),
     feature: str = typer.Option(..., "--feature", "-f"),
-    config: str = typer.Option("config.yaml", "--config", "-c"),
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c"),
     env: Optional[str] = typer.Option(None, "--env"),
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
@@ -233,10 +233,10 @@ def data_source(
         kb.close()
 
 
-@app.command("dependency-report")
+@app.command("dependencies")
 def dependency_report(
     project: str = typer.Option(..., "--project", "-p"),
-    config: str = typer.Option("config.yaml", "--config", "-c"),
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c"),
     env: Optional[str] = typer.Option(None, "--env"),
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
@@ -253,7 +253,7 @@ def dependency_report(
 @app.command("search")
 def search(
     query: str = typer.Argument(...),
-    config: str = typer.Option("config.yaml", "--config", "-c"),
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c"),
     repo: Optional[str] = typer.Option(None, "--repo", "--project", "-p"),
     limit: int = typer.Option(25, "--limit"),
 ):

@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from corp_kb.utils import json_dumps, stable_id
+from proofline.utils import json_dumps, stable_id
 
 
 def build_endpoint_dependency_map(api_endpoints: pd.DataFrame, runtime_endpoint_edges: pd.DataFrame, static_edges: pd.DataFrame, service_identity: pd.DataFrame) -> pd.DataFrame:

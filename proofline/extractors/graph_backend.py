@@ -4,7 +4,7 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
-from corp_kb.utils import json_loads, now_iso
+from proofline.utils import json_loads, now_iso
 
 
 def _props(raw: Any) -> Dict[str, Any]:
@@ -22,7 +22,7 @@ def _chunks(rows: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, An
         yield rows[i:i + size]
 
 
-def export_graph_to_neo4j(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
+def publish_graph_backend(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
     neo = cfg.get("neo4j", {})
     if not neo.get("enabled", False):
         return pd.DataFrame([{
@@ -34,7 +34,7 @@ def export_graph_to_neo4j(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
         from neo4j import GraphDatabase
     except Exception as e:
         raise RuntimeError(
-            "Neo4j export is enabled, but the neo4j Python package is missing. "
+            "Graph publishing is enabled, but the neo4j Python package is missing. "
             "Run: ./scripts/bootstrap.sh"
         ) from e
 

@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List
 import pandas as pd
 import yaml
 
-from corp_kb.utils import safe_read_text, stable_id, normalize_name
+from proofline.utils import safe_read_text, stable_id, normalize_name
 
 URL_RE = re.compile(r"https?://[A-Za-z0-9_.:/\-{}$]+")
 HOST_RE = re.compile(r"\b([a-z0-9][a-z0-9-]+(?:\.[a-z0-9][a-z0-9-]+){1,})(?::\d+)?\b", re.I)

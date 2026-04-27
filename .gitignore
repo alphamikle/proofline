@@ -3,8 +3,10 @@
 data/
 repos/
 config.yaml
+proofline.yaml
 __pycache__/
 *.pyc
+*.egg-info/
 .DS_Store
 .idea
 .vscode

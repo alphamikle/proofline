@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 import pandas as pd
 from rich.console import Console
 
-from corp_kb.utils import json_dumps, now_iso, stable_id
+from proofline.utils import json_dumps, now_iso, stable_id
 
 console = Console()
 

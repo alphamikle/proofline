@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 import yaml
 
-from corp_kb.utils import safe_read_text, stable_id, json_dumps, normalize_name
+from proofline.utils import safe_read_text, stable_id, json_dumps, normalize_name
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
 

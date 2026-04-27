@@ -6,6 +6,9 @@ from typing import Any, Dict
 
 import yaml
 
+DEFAULT_CONFIG = "proofline.yaml"
+CONFIG_ENV_VAR = "PROOFLINE_CONFIG"
+
 
 def _expand_env(value: Any) -> Any:
     if isinstance(value, str):
@@ -30,15 +33,13 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 def load_config(path: str | Path) -> Dict[str, Any]:
     path = Path(path)
     if not path.exists():
-        # Fall back to config.example.yaml if user has not copied it yet.
-        example = Path(__file__).resolve().parents[1] / "config.example.yaml"
-        if example.exists():
-            path = example
-        else:
-            raise FileNotFoundError(f"Config file not found: {path}")
+        raise FileNotFoundError(
+            f"Config file not found: {path}. Run `proofline init` or pass --config."
+        )
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     cfg = _expand_env(cfg)
+    _normalize_graph_backend(cfg)
     root = Path(cfg.get("workspace", "./data"))
     cfg["workspace"] = str(root)
     cfg.setdefault("storage", {})
@@ -49,6 +50,17 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     cfg.setdefault("repos", {})
     cfg["repos"].setdefault("root", "./repos")
     return cfg
+
+
+def _normalize_graph_backend(cfg: Dict[str, Any]) -> None:
+    backend = dict(cfg.get("graph_backend") or {})
+    if not backend:
+        return
+    provider = backend.get("provider", "neo4j")
+    if provider != "neo4j":
+        return
+    neo4j = {k: v for k, v in backend.items() if k != "provider"}
+    cfg["neo4j"] = deep_merge(dict(cfg.get("neo4j") or {}), neo4j)
 
 
 def ensure_dirs(cfg: Dict[str, Any]) -> None:

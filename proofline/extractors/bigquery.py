@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from corp_kb.utils import json_dumps, stable_id
+from proofline.utils import json_dumps, stable_id
 
 
 def _client(project_id: str | None):

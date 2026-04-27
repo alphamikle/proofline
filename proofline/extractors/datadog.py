@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
-from corp_kb.utils import dd_time_window, epoch_window, flatten_json, json_dumps, pick_first, stable_id
+from proofline.utils import dd_time_window, epoch_window, flatten_json, json_dumps, pick_first, stable_id
 
 SITE_HOSTS = {
     "datadoghq.com": "https://api.datadoghq.com",

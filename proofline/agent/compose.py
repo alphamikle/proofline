@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from corp_kb.agent.providers import AgentProviderError, complete_with_agent
-from corp_kb.utils import json_dumps
+from proofline.agent.providers import AgentProviderError, complete_with_agent
+from proofline.utils import json_dumps
 
 SYSTEM_RULES = """
 You are an engineering LLM agent operating over a local evidence-backed knowledge graph.

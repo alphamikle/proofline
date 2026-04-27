@@ -1,44 +1,68 @@
-# corp-kb-poc
+# proofline
 
-A local proof of concept for building an evidence-backed knowledge graph around a corporate codebase, Datadog runtime signals, and BigQuery metadata/lineage signals.
-
-The core idea is not to pass all repositories and logs directly to an LLM. The pipeline converts available sources into local facts first:
+Proofline builds a local, evidence-backed knowledge graph around corporate repositories, API specs, runtime signals, data lineage metadata, and documentation. The goal is to answer engineering questions from observed facts instead of pushing a pile of raw repos and logs directly into an LLM.
 
 ```text
 repos + code/docs/configs/API specs
-+ Datadog services/dependencies/spans/logs
-+ BigQuery jobs/table usage
--> kb.duckdb + FTS index + graph tables
--> ask.sh / local LLM context pack
++ runtime signals
++ warehouse metadata
+-> local facts, indexes, graph tables
+-> proofline ask / impact / data-source / dependencies
 ```
 
-## What this package builds
+## Install
 
-The pipeline is designed to run with a single command and produce:
-
-- `repo_inventory`: classification for all repositories: service, library, frontend, job, infra, or unknown.
-- `repo_files`: current-checkout file index, excluding `.git`, `node_modules`, build artifacts, and similar low-signal paths.
-- `code_chunks` plus SQLite FTS: local full-text search over code, docs, configs, and API specs.
-- `api_contracts` and `api_endpoints`: OpenAPI, Swagger, proto/gRPC, GraphQL, and static route extraction.
-- `static_edges`: package, config, URL, host, topic, and BigQuery references.
-- `datadog_service_edges`: Datadog APM service dependency graph.
-- `datadog_spans` and `datadog_logs`: normalized runtime facts from spans and logs.
-- `runtime_service_edges`: observed runtime service, data, topic, and host dependencies.
-- `runtime_endpoint_edges`: endpoint/resource-level runtime dependencies when Datadog fields are available.
-- `bq_jobs` and `bq_table_usage`: BigQuery job metadata and table usage from `INFORMATION_SCHEMA.JOBS_BY_ORGANIZATION`.
-- `service_identity` and `entity_aliases`: repo to Datadog service to service account to canonical service identity mapping.
-- `nodes`, `edges`, and `evidence`: local unified graph tables.
-- `endpoint_dependency_map`: endpoint to downstream service/table/topic/host map.
-- `data_capabilities`: candidates for selecting a source service or table for a feature.
-- `compatibility_index`: entities where changes require compatibility checks.
-
-## Installation
+Quick install or update:
 
 ```bash
-git clone <this-poc-repo>
-cd corp-kb-poc
-./scripts/bootstrap.sh
+curl -o- https://raw.githubusercontent.com/alphamikle/proofline/main/install.sh | bash
 ```
+
+Or with `wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/alphamikle/proofline/main/install.sh | bash
+```
+
+The installer clones Proofline into `~/.proofline`, creates `~/.proofline/.venv`, installs the `proofline` and `pfl` CLIs, creates `~/.proofline/proofline.yaml` with local data paths under `~/.proofline`, and links the executables to `~/.local/bin`.
+
+Useful installer environment variables:
+
+```bash
+PROOFLINE_DIR="$HOME/tools/proofline" \
+PROOFLINE_BIN_DIR="$HOME/bin" \
+PROOFLINE_REF="main" \
+curl -o- https://raw.githubusercontent.com/alphamikle/proofline/main/install.sh | bash
+```
+
+The optional CodeGraphContext stack is intentionally skipped by default because it installs extra local tooling. Enable it explicitly:
+
+```bash
+PROOFLINE_INSTALL_CGC=1 curl -o- https://raw.githubusercontent.com/alphamikle/proofline/main/install.sh | bash
+```
+
+After installation:
+
+```bash
+proofline doctor --config "$HOME/.proofline/proofline.yaml"
+pfl doctor --config "$HOME/.proofline/proofline.yaml"
+```
+
+If your shell cannot find `proofline` or `pfl`, add this to your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Development checkout:
+
+```bash
+git clone <this-repo>
+cd proofline
+bash scripts/install.sh
+```
+
+When run from a checkout, `scripts/install.sh` installs the current working tree into `~/.proofline`. That is useful while developing or before changes have been pushed to GitHub.
 
 Manual Python-only setup:
 
@@ -46,20 +70,15 @@ Manual Python-only setup:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp config.example.yaml config.yaml
+pip install -e .
+proofline init
 ```
 
-Full setup also runs the CodeGraphContext installer from `/Users/alfa/dev/code/infra/cgc.sh`:
+`proofline init` creates `proofline.yaml` from `proofline.example.yaml` and prepares local working directories.
 
-```bash
-./scripts/bootstrap.sh
-```
+## Configure
 
-This installs local Qwen/SentenceTransformers, FAISS, Neo4j Python client, CodeGraphContext, the broad SCIP indexer stack, and starts the local Neo4j Docker container used by CGC. The SCIP stack includes Python, TypeScript/JavaScript, Go, Rust, Java/Scala/Kotlin, C/C++/CUDA, Ruby, C#/Visual Basic, Dart, and PHP where the current platform supports the indexer binaries. The runtime stages are still controlled through `config.yaml`, so you can keep Qwen embeddings, reranking, Neo4j export, or CodeGraphContext disabled while the tooling remains available.
-
-## Input preparation
-
-Put corporate repositories under `./repos`:
+Put repositories under `./repos`:
 
 ```text
 repos/
@@ -68,164 +87,127 @@ repos/
   repo-c/.git
 ```
 
-Or provide a repository URL file in `config.yaml`:
+Or configure a clone URL file in `proofline.yaml`:
 
 ```yaml
 repos:
   root: ./repos
   clone_urls_file: ./repo_urls.txt
-  update_existing: false
+  update_existing: true
 ```
 
-Datadog credentials:
+Common credentials:
 
 ```bash
 export DD_API_KEY=...
 export DD_APP_KEY=...
-export DD_SITE=datadoghq.com   # or datadoghq.eu / us3.datadoghq.com / us5.datadoghq.com / ap1 / ap2
-```
+export DD_SITE=datadoghq.com
 
-BigQuery credentials:
-
-```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 export GOOGLE_CLOUD_PROJECT=your-bq-project
-```
 
-For user credentials:
-
-```bash
-gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT=your-bq-project
-```
-
-Atlassian credentials:
-
-```bash
 export ATLASSIAN_EMAIL=you@company.com
 export ATLASSIAN_API_TOKEN=...
 export CONFLUENCE_BASE_URL=https://your-company.atlassian.net/wiki
 export JIRA_BASE_URL=https://your-company.atlassian.net
 ```
 
-For Server/Data Center or OAuth-style setups, use:
+For Server/Data Center or OAuth-style Atlassian setups:
 
 ```bash
 export ATLASSIAN_BEARER_TOKEN=...
 ```
 
-Mirror Confluence and Jira locally before indexing:
+Check setup:
 
 ```bash
-make confluence
-make jira
+proofline doctor
 ```
 
-Confluence stores pages/blogposts, storage/view HTML bodies, comments, attachment metadata, and attachment files under `data/raw/confluence`. Jira stores issues, comments, changelogs, worklogs, remote links, issue properties, attachments, and site metadata under `data/raw/jira`.
+## CLI
 
-## Run the full pipeline
+Main commands:
 
 ```bash
-./run.sh
+proofline init
+proofline doctor
+proofline sync
+proofline sync repos
+proofline sync docs
+proofline sync runtime
+proofline sync data
+proofline build
+proofline build code
+proofline build graph
+proofline build embeddings
+proofline build capabilities
+proofline publish
+proofline run --from runtime --to graph
+proofline stage smoke
+proofline status
+pfl status
 ```
 
-Equivalent command:
+`proofline` and `pfl` are equivalent. `sync` updates source facts. `build` derives local indexes and graph structures. `publish` sends the graph to the configured external graph backend.
 
-```bash
-python3 -m corp_kb.pipeline.runner full --config config.yaml
-```
-
-Continue from a specific stage:
-
-```bash
-python3 -m corp_kb.pipeline.runner full --config config.yaml --from-stage datadog
-python3 -m corp_kb.pipeline.runner stage graph --config config.yaml
-```
-
-Pipeline stages:
+Default config resolution:
 
 ```text
-repo_ingest
-code_index
-embeddings
-api_surface
-code_graph
-static_edges
-datadog
-bigquery
-entity_resolution
-graph
-endpoint_map
-capabilities
-neo4j_export
-smoke
+--config
+PROOFLINE_CONFIG
+./proofline.yaml
 ```
 
-Qwen/FAISS semantic retrieval:
+## Typical Workflow
 
-```yaml
-indexing:
-  embeddings:
-    enabled: true
-    model_name: Qwen/Qwen3-Embedding-0.6B
-    max_chunks: 10000   # recommended for first dry run
-retrieval:
-  reranker:
-    enabled: true
-    model_name: Qwen/Qwen3-Reranker-0.6B
-```
-
-Build only the vector index:
+Create or refresh local facts:
 
 ```bash
-./run.sh --from-stage embeddings --to-stage embeddings
+proofline sync repos
+proofline sync docs
+proofline sync runtime
+proofline sync data
 ```
 
-Neo4j projection:
-
-```yaml
-neo4j:
-  enabled: true
-  uri: bolt://localhost:7687
-  username: neo4j
-  password: codegraphcontext
-```
-
-CodeGraphContext hook:
-
-```yaml
-code_graph:
-  enabled: true
-  command: "$HOME/.local/bin/cgc index {repo_path}"
-```
-
-## Quick smoke checks
+Build derived indexes and the local graph:
 
 ```bash
-python3 -m corp_kb.pipeline.runner stage smoke --config config.yaml
+proofline build
 ```
 
-You can also inspect the database directly:
+Run the full pipeline:
 
 ```bash
-duckdb ./data/kb.duckdb
+proofline run
 ```
 
-Example SQL checks:
+Continue from or stop at a step:
 
-```sql
-SELECT probable_type, COUNT(*) FROM repo_inventory GROUP BY 1 ORDER BY 2 DESC;
-SELECT * FROM service_identity ORDER BY confidence DESC LIMIT 20;
-SELECT * FROM runtime_service_edges ORDER BY confidence DESC, count DESC NULLS LAST LIMIT 50;
-SELECT * FROM endpoint_dependency_map ORDER BY confidence DESC LIMIT 50;
+```bash
+proofline run --from runtime
+proofline run --from embeddings --to embeddings
+proofline run --from runtime --to graph
 ```
 
-## Ask the agent
+Useful stage aliases:
+
+```text
+repos       -> repo_ingest
+code        -> code_index
+api         -> api_surface
+runtime     -> datadog
+data        -> bigquery
+identity    -> entity_resolution
+endpoints   -> endpoint_map
+publish     -> external graph backend projection
+```
+
+## Ask Questions
 
 Impact analysis:
 
 ```bash
-./ask.sh impact \
+proofline impact \
   --project checkout-api \
   --feature "add payment eligibility field"
 ```
@@ -233,7 +215,7 @@ Impact analysis:
 Data-source recommendation:
 
 ```bash
-./ask.sh data-source \
+proofline data-source \
   --project checkout-api \
   --feature "show customer payment eligibility"
 ```
@@ -241,7 +223,7 @@ Data-source recommendation:
 Dependency report:
 
 ```bash
-./ask.sh dependency-report \
+proofline dependencies \
   --project checkout-api \
   --env prod \
   --window-days 30
@@ -250,20 +232,46 @@ Dependency report:
 Natural language:
 
 ```bash
-./ask.sh "If I implement payment eligibility in project checkout-api, what can break?"
+proofline ask "If I implement payment eligibility in project checkout-api, what can break?"
 ```
 
-Raw context pack instead of a markdown answer:
+Raw context pack:
 
 ```bash
-./ask.sh impact --project checkout-api --feature "payment eligibility" --raw-context
+proofline impact --project checkout-api --feature "payment eligibility" --raw-context
 ```
 
-## Connect an external LLM
+Search:
 
-By default, `agent.provider: none`, so `ask.sh` generates a deterministic markdown report from graph facts.
+```bash
+proofline search "payment eligibility" --project checkout-api
+```
 
-For a local model or any corporate-approved CLI, use `provider: cli`; the command receives the full prompt on stdin and should write the answer to stdout:
+## External Graph Backend
+
+Graph publishing is configured through `graph_backend`:
+
+```yaml
+graph_backend:
+  enabled: true
+  provider: neo4j
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: codegraphcontext
+  database: neo4j
+```
+
+Publish with:
+
+```bash
+proofline publish
+```
+
+## LLM Answers
+
+By default, `agent.provider: none`, so Proofline generates deterministic markdown from graph facts.
+
+For a local model or any corporate-approved CLI, use `provider: cli`; the command receives the full prompt on stdin and writes the answer to stdout:
 
 ```yaml
 agent:
@@ -275,14 +283,14 @@ HTTP providers are also supported:
 
 ```yaml
 agent:
-  provider: openai              # OpenAI Responses API
+  provider: openai
   model: gpt-5.2
   api_key_env: OPENAI_API_KEY
 ```
 
 ```yaml
 agent:
-  provider: openai_compatible   # /v1/chat/completions, for local/corporate gateways
+  provider: openai_compatible
   model: qwen2.5-coder:32b
   base_url: http://localhost:11434/v1
   api_key_env: ""
@@ -290,34 +298,24 @@ agent:
 
 ```yaml
 agent:
-  provider: anthropic           # Anthropic Messages API
+  provider: anthropic
   model: claude-sonnet-4-6
   api_key_env: ANTHROPIC_API_KEY
 ```
 
-```yaml
-agent:
-  provider: anthropic_compatible # /v1/messages, for Claude-compatible gateways
-  model: your-corporate-model
-  base_url: https://llm-gateway.example.com/v1
-  api_key_env: ANTHROPIC_API_KEY
-```
-
-The script sends a compact JSON context pack and system rules to the LLM. The rules instruct the model to avoid unsupported facts and to separate runtime, static, BigQuery/data, and ownership evidence. `agent.enrichment.model` is reserved for offline enrichment stages: for example, summarizing Confluence pages, extracting Jira feature ownership, or normalizing service names before the answer-time agent runs.
-
-## Output locations
+## Local Outputs
 
 ```text
 data/
-  kb.duckdb                         # main local database
-  indexes/code_fts.sqlite           # FTS index over chunks
-  indexes/code_vectors.faiss        # FAISS vector index when embeddings are enabled
-  indexes/code_vectors_meta.parquet # FAISS id -> chunk metadata
-  raw/datadog/...                   # raw-ish Datadog extracts when enabled
-  raw/bigquery/...                  # raw-ish BigQuery extracts when enabled
-  raw/confluence/...                # mirrored Confluence content and files
-  raw/jira/...                      # mirrored Jira issues and files
-  reports/                          # reserved for future report exports
+  kb.duckdb
+  indexes/code_fts.sqlite
+  indexes/code_vectors.faiss
+  indexes/code_vectors_meta.parquet
+  raw/datadog/...
+  raw/bigquery/...
+  raw/confluence/...
+  raw/jira/...
+  reports/
 ```
 
 Main tables:
@@ -348,10 +346,11 @@ endpoint_dependency_map
 data_capabilities
 compatibility_index
 code_graph_runs
-neo4j_exports
+graph_backend_exports
+pipeline_runs
 ```
 
-## Confidence interpretation
+## Confidence
 
 Approximate scale:
 
@@ -359,29 +358,12 @@ Approximate scale:
 0.20-0.35: weak textual/static inference
 0.40-0.55: regex/config/package evidence
 0.60-0.75: API/static route/client evidence
-0.80-0.90: Datadog service dependency / BigQuery metadata evidence
-0.95+: runtime spans/logs plus static/config/API corroboration
+0.80-0.90: runtime dependency / warehouse metadata evidence
+0.95+: runtime signals plus static/config/API corroboration
 ```
 
-Important: `not observed in Datadog` does not mean `does not exist`. It only means that the dependency was not found in the available runtime window or fields.
+`not observed in runtime data` does not mean `does not exist`. It only means the dependency was not found in the available window or fields.
 
-## Current limitations
+## Principle
 
-- Entity resolution is best-effort. `unresolved_entities` shows where repo, service, Datadog, or service-account names were not merged.
-- Endpoint-level graph quality depends on Datadog fields such as `service`, `env`, `trace_id`, `span_id`, `http.route`, `resource`, `peer.service`, `db.name`, and `messaging.destination`.
-- The BigQuery layer uses metadata and job history, not table contents.
-- Static route extraction covers common frameworks with regex-based heuristics. A production-grade version should add tree-sitter, LSP, or SCIP adapters.
-- Raw `.git/objects` are not embedded directly. The pipeline extracts git metadata through `git log`.
-
-## Architecture principle
-
-The LLM is not the source of truth. The sources of truth are:
-
-```text
-code/config/API specs
-Datadog runtime observations
-BigQuery job/table metadata
-ownership/catalog/git evidence
-```
-
-The LLM receives a compact context pack and turns it into an engineering answer.
+The LLM is not the source of truth. The sources of truth are code, configs, API specs, runtime observations, warehouse metadata, ownership/catalog data, and git evidence. The LLM receives a compact context pack and turns it into an engineering answer.
