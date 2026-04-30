@@ -6,6 +6,11 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+# macOS ML stacks can load libomp through more than one dependency
+# (for example faiss plus torch/sentence-transformers). Without this,
+# the OpenMP runtime can abort the process before Python can recover.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import typer
 import yaml
 
@@ -14,7 +19,10 @@ from proofline.config import CONFIG_ENV_VAR, DEFAULT_CONFIG, config_followup_war
 from proofline.logging_utils import console, setup_logging
 from proofline.pipeline.runner import STAGES, resolve_stage, run_order, run_stage
 from proofline.storage import KB
+from proofline.uninstall import run_uninstall, uninstall_plan
+from proofline.upgrade import DEFAULT_REF, DEFAULT_REPO, UpgradeError, run_upgrade
 from proofline.utils import json_dumps
+from proofline.version import version_info
 
 app = typer.Typer(help="Proofline CLI")
 
@@ -235,6 +243,93 @@ def doctor(
 
 
 @app.command()
+def version(
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show Proofline CLI version and install details."""
+    info = version_info()
+    if json_output:
+        typer.echo(json_dumps(info))
+        return
+    console.print(f"Proofline {info['version']}")
+    console.print(f"Package: {info['package_root']}")
+    console.print(f"Python:  {info['python']}")
+    git = info.get("git") or {}
+    if git.get("available"):
+        dirty = " dirty" if git.get("dirty") else ""
+        console.print(f"Git:     {git.get('branch') or '?'}@{git.get('commit') or '?'}{dirty}")
+        if git.get("remote"):
+            console.print(f"Remote:  {git.get('remote')}")
+    else:
+        console.print("Git:     unavailable")
+
+
+@app.command()
+def upgrade(
+    repo: Optional[str] = typer.Option(None, "--repo", help=f"Git repository to install from. Default: {DEFAULT_REPO} or PROOFLINE_REPO."),
+    ref: Optional[str] = typer.Option(None, "--ref", help=f"Git branch/tag/ref to install. Default: {DEFAULT_REF} or PROOFLINE_REF."),
+    install_dir: Optional[str] = typer.Option(None, "--dir", help="Proofline install directory. Default: current package root or PROOFLINE_DIR."),
+    bin_dir: Optional[str] = typer.Option(None, "--bin-dir", help="Directory for proofline/pfl shims. Default: ~/.local/bin or PROOFLINE_BIN_DIR."),
+    source_dir: Optional[str] = typer.Option(None, "--source-dir", help="Upgrade from a local checkout instead of remote git."),
+    force: bool = typer.Option(False, "--force", help="Allow upgrading a dirty git checkout or skip non-git code backup."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done without changing files."),
+    skip_deps: bool = typer.Option(False, "--skip-deps", help="Skip pip dependency/package reinstall."),
+) -> None:
+    """Upgrade the Proofline CLI in place."""
+    try:
+        run_upgrade(
+            repo=repo,
+            ref=ref,
+            install_dir=install_dir,
+            bin_dir=bin_dir,
+            source_dir=source_dir,
+            force=force,
+            dry_run=dry_run,
+            skip_deps=skip_deps,
+        )
+    except UpgradeError as exc:
+        print(f"Upgrade failed: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
+
+
+@app.command()
+def uninstall(
+    install_dir: Optional[str] = typer.Option(None, "--dir", help="Proofline install directory. Default: current package root or PROOFLINE_DIR."),
+    bin_dir: Optional[str] = typer.Option(None, "--bin-dir", help="Directory containing proofline/pfl shims. Default: ~/.local/bin or PROOFLINE_BIN_DIR."),
+    include_cgc: bool = typer.Option(False, "--include-cgc", help="Also remove CGC/SCIP binaries and CGC venv/node tooling. CGC data and Docker volumes are preserved."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be removed without deleting anything."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm uninstall without prompting."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Uninstall Proofline CLI/runtime while preserving indexed data and configs."""
+    plan = uninstall_plan(install_dir=install_dir, bin_dir=bin_dir, include_cgc=include_cgc)
+    if json_output:
+        typer.echo(json_dumps(plan))
+        if dry_run:
+            return
+    else:
+        console.print("[bold]Proofline uninstall plan[/bold]")
+        console.print("\nWill remove:")
+        for path in plan["remove"] or ["<nothing>"]:
+            console.print(f"  {path}")
+        console.print("\nWill preserve:")
+        for path in plan["preserve"] or ["<nothing>"]:
+            console.print(f"  {path}")
+    if dry_run:
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            raise typer.BadParameter("Refusing to uninstall without --yes in a non-interactive shell.")
+        if not typer.confirm("Remove the listed Proofline files?", default=False):
+            console.print("Uninstall cancelled.")
+            return
+    result = run_uninstall(install_dir=install_dir, bin_dir=bin_dir, include_cgc=include_cgc, dry_run=False)
+    if not json_output:
+        console.print(f"[green]Removed {len(result['remove'])} paths.[/green]")
+        console.print("Preserved data/config paths listed above.")
+
+
+@app.command()
 def run(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     from_stage: Optional[str] = typer.Option(None, "--from"),
@@ -385,9 +480,12 @@ def ask(
     project: Optional[str] = typer.Option(None, "--project"),
     env: Optional[str] = typer.Option(None, "--env"),
     window_days: Optional[int] = typer.Option(None, "--window-days"),
+    agent_name: Optional[str] = typer.Option(None, "--agent"),
     raw_context: bool = typer.Option(False, "--raw-context"),
+    raw_trace: bool = typer.Option(False, "--raw-trace"),
+    quiet: bool = typer.Option(False, "--quiet"),
 ) -> None:
-    ask_commands.ask(question, config_path(config), project, env, window_days, raw_context)
+    ask_commands.ask(question, config_path(config), project, env, window_days, raw_context, raw_trace, quiet, agent_name)
 
 
 @app.command()
@@ -438,7 +536,8 @@ def search(
 @app.command()
 def bootstrap() -> None:
     """Run the local bootstrap script."""
-    subprocess.run(["./scripts/bootstrap.sh"], check=True)
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run([str(root / "scripts" / "bootstrap.sh")], cwd=str(root), check=True)
 
 
 if __name__ == "__main__":

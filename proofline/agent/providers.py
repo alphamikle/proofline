@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 from urllib.parse import urljoin
 
 import requests
@@ -12,8 +12,86 @@ class AgentProviderError(RuntimeError):
     pass
 
 
-def complete_with_agent(system_prompt: str, user_prompt: str, cfg: Dict[str, Any]) -> str | None:
-    agent = cfg.get("agent", {})
+AgentEventCallback = Callable[[str, Dict[str, Any]], None]
+
+
+def complete_with_agent(
+    system_prompt: str,
+    user_prompt: str,
+    cfg: Dict[str, Any],
+    *,
+    agent_name: str | None = None,
+    on_event: AgentEventCallback | None = None,
+) -> str | None:
+    agents = agent_candidates(cfg, agent_name=agent_name)
+    if not agents:
+        return None
+    errors: List[str] = []
+    attempted = False
+    for idx, agent in enumerate(agents):
+        name = str(agent.get("name") or f"agent-{idx + 1}")
+        provider = str(agent.get("provider", "none") or "none").lower()
+        if provider in {"", "none"}:
+            continue
+        attempted = True
+        if on_event:
+            on_event("agent_attempt", {"name": name, "provider": provider, "model": agent.get("model")})
+        try:
+            text = _complete_with_single_agent(system_prompt, user_prompt, agent)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            if on_event:
+                on_event("agent_error", {"name": name, "provider": provider, "error": str(e)})
+            continue
+        if text:
+            if on_event:
+                on_event("agent_success", {"name": name, "provider": provider, "model": agent.get("model")})
+            return text
+        errors.append(f"{name}: returned no text")
+        if on_event:
+            on_event("agent_empty", {"name": name, "provider": provider})
+    if not attempted:
+        return None
+    if errors:
+        raise AgentProviderError("All configured agents failed: " + "; ".join(errors))
+    return None
+
+
+def agent_candidates(cfg: Dict[str, Any], *, agent_name: str | None = None) -> List[Dict[str, Any]]:
+    root = dict(cfg.get("agent") or {})
+    configured = root.get("agents")
+    if isinstance(configured, dict):
+        configured = [{"name": name, **(profile or {})} for name, profile in configured.items()]
+    if not isinstance(configured, list) or not configured:
+        legacy = {k: v for k, v in root.items() if k not in {"active", "agents", "fallback"}}
+        if "name" not in legacy:
+            legacy["name"] = str(root.get("active") or "default")
+        return [legacy]
+
+    common = {k: v for k, v in root.items() if k not in {"active", "agents", "fallback"}}
+    profiles: List[Dict[str, Any]] = []
+    for idx, item in enumerate(configured):
+        if not isinstance(item, dict):
+            continue
+        merged = dict(common)
+        merged.update(item)
+        merged.setdefault("name", f"agent-{idx + 1}")
+        profiles.append(merged)
+
+    selected = str(agent_name or os.getenv("PROOFLINE_AGENT") or root.get("active") or "").strip()
+    fallback_enabled = bool(root.get("fallback", True))
+    if selected:
+        selected_profiles = [p for p in profiles if str(p.get("name") or "") == selected]
+        if not selected_profiles:
+            raise AgentProviderError(f"Configured agent not found: {selected}")
+        if not fallback_enabled:
+            return selected_profiles
+        rest = [p for p in profiles if str(p.get("name") or "") != selected]
+        return selected_profiles + rest
+    return profiles if fallback_enabled else profiles[:1]
+
+
+def _complete_with_single_agent(system_prompt: str, user_prompt: str, agent: Dict[str, Any]) -> str | None:
     provider = str(agent.get("provider", "none") or "none").lower()
     if provider == "command":
         provider = "cli"

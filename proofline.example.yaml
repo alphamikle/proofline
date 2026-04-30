@@ -264,6 +264,22 @@ code_graph:
   max_repos: null
 
 agent:
+  # Legacy single-agent shape below still works. For multiple agents, set
+  # active/fallback and add profiles under agents. Shared fields here are
+  # inherited by profiles.
+  #
+  # active: local
+  # fallback: true
+  # agents:
+  #   - name: local
+  #     provider: openai_compatible
+  #     model: qwen2.5-coder:32b
+  #     base_url: http://localhost:11434/v1
+  #     api_key_env: ""
+  #   - name: cloud
+  #     provider: openai
+  #     model: gpt-5.2
+  #     api_key_env: OPENAI_API_KEY
   provider: none          # none | cli | openai | openai_compatible | anthropic | anthropic_compatible
   model: null             # example: "gpt-5.2", "claude-sonnet-4-6", "qwen2.5-coder:32b"
   command: null           # used by provider=cli, example: "ollama run qwen2.5-coder:32b"

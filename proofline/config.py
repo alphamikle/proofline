@@ -202,7 +202,20 @@ def config_followup_warnings(cfg: Dict[str, Any]) -> List[str]:
         if section.get("enabled") and not os.getenv(env_name) and str(section.get("base_url") or "").startswith("${"):
             warnings.append(f"{key} is enabled but {env_name} is not set")
     agent = cfg.get("agent", {})
-    if agent.get("provider") not in (None, "", "none") and not (agent.get("model") or agent.get("command")):
+    agents = agent.get("agents")
+    if isinstance(agents, list) and agents:
+        active = str(agent.get("active") or "").strip()
+        names = [str(a.get("name") or "") for a in agents if isinstance(a, dict)]
+        if active and active not in names:
+            warnings.append(f"agent.active={active} does not match any configured agent name")
+        for item in agents:
+            if not isinstance(item, dict):
+                continue
+            provider = item.get("provider", agent.get("provider"))
+            if provider not in (None, "", "none") and not (item.get("model") or item.get("command") or agent.get("model") or agent.get("command")):
+                warnings.append(f"agent {item.get('name') or '<unnamed>'} provider is enabled but model/command is empty")
+                break
+    elif agent.get("provider") not in (None, "", "none") and not (agent.get("model") or agent.get("command")):
         warnings.append("agent provider is enabled but model/command is empty")
     return warnings
 

@@ -9,6 +9,7 @@ from proofline.logging_utils import setup_logging
 from proofline.storage import KB
 from proofline.agent.tools import KBTools
 from proofline.agent.compose import maybe_llm_answer, render_markdown
+from proofline.agent.loop import run_agentic_ask
 from proofline.utils import json_dumps
 
 app = typer.Typer(help="Ask the local corporate knowledge graph")
@@ -160,43 +161,30 @@ def ask(
     env: Optional[str] = typer.Option(None, "--env"),
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
+    raw_trace: bool = typer.Option(False, "--raw-trace"),
+    quiet: bool = typer.Option(False, "--quiet"),
+    agent_name: Optional[str] = typer.Option(None, "--agent"),
 ):
     setup_logging()
     cfg, kb, tools = tools_for(config)
     try:
-        env = env or cfg.get("agent", {}).get("default_env", "prod")
-        window_days = window_days or int(cfg.get("agent", {}).get("default_window_days", 30))
-        qtype = classify_question(question)
-        p, f = extract_project_feature(question)
-        p = project or p
-        if qtype == "dependency_report":
-            if not p:
-                raise typer.BadParameter("Could not infer the project. Pass --project.")
-            ctx = build_dependency_context(tools, p, env, window_days)
-        elif qtype == "data_source_recommendation":
-            if not p:
-                raise typer.BadParameter("Could not infer the project. Pass --project.")
-            ctx = build_data_source_context(tools, p, f, env, window_days)
-        elif qtype == "impact_analysis":
-            if not p:
-                raise typer.BadParameter("Could not infer the project. Pass --project.")
-            ctx = build_impact_context(tools, p, f, env, window_days)
-        else:
-            resolved = tools.resolve_project(p) if p else {}
-            repo_id = (resolved.get("service") or {}).get("repo_id") if resolved.get("found") else None
-            sid = (resolved.get("service") or {}).get("service_id") if resolved.get("found") else ""
-            ctx = {
-                "question_type": "generic",
-                "question": question,
-                "project": resolved,
-                "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=100) if sid else {},
-                "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=100) if repo_id else {},
-                "change_history": tools.get_change_history(sid, question, limit=40) if sid else {},
-                "capabilities": tools.search_capabilities(question, limit=25),
-                "code_graph": tools.search_code_graph(question, repo_id=repo_id, limit=40),
-                "code_hits": tools.search_code(question, repo_id=repo_id, limit=25),
-            }
-        emit_context_or_answer(ctx, cfg, raw_context)
+        result = run_agentic_ask(
+            question,
+            tools,
+            cfg,
+            project=project,
+            env=env,
+            window_days=window_days,
+            agent_name=agent_name,
+            quiet=quiet,
+            raw_trace=raw_trace,
+        )
+        if raw_context:
+            typer.echo(json_dumps(result))
+            return
+        final = result.get("final") or {}
+        answer = final.get("answer") if isinstance(final, dict) else None
+        typer.echo(str(answer or "").strip() or json_dumps(final))
     finally:
         kb.close()
 
