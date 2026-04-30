@@ -48,6 +48,12 @@ proofline doctor --config "$HOME/.proofline/proofline.yaml"
 pfl doctor --config "$HOME/.proofline/proofline.yaml"
 ```
 
+If local dependencies, CGC, or Neo4j/Docker drift out of shape, run:
+
+```bash
+pfl repair --config "$HOME/.proofline/proofline.yaml"
+```
+
 If your shell cannot find `proofline` or `pfl`, add this to your shell profile:
 
 ```bash
@@ -148,9 +154,10 @@ proofline run --from runtime --to graph
 proofline stage smoke
 proofline status
 pfl status
+pfl repair
 ```
 
-`proofline` and `pfl` are equivalent. `sync` updates source facts. `build` derives local indexes and graph structures. `publish` sends the graph to the configured external graph backend.
+`proofline` and `pfl` are equivalent. `sync` updates source facts. `build` derives local indexes and graph structures. `publish` sends the graph to the configured external graph backend. `repair` recreates missing config directories, refreshes Python dependencies and CLI links, and runs the CGC/SCIP/Neo4j Docker bootstrap.
 
 Default config resolution:
 

@@ -14,11 +14,9 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import typer
 import yaml
 
-from proofline.agent import ask as ask_commands
 from proofline.config import CONFIG_ENV_VAR, DEFAULT_CONFIG, config_followup_warnings, default_config, ensure_dirs, load_config, migrate_config_file
 from proofline.logging_utils import console, setup_logging
-from proofline.pipeline.runner import STAGES, resolve_stage, run_order, run_stage
-from proofline.storage import KB
+from proofline.repair import run_repair
 from proofline.uninstall import run_uninstall, uninstall_plan
 from proofline.upgrade import DEFAULT_REF, DEFAULT_REPO, UpgradeError, run_upgrade
 from proofline.utils import json_dumps
@@ -32,12 +30,16 @@ def config_path(config: Optional[str]) -> str:
 
 
 def load_runtime(config: Optional[str]) -> tuple[dict[str, Any], KB]:
+    from proofline.storage import KB
+
     cfg = load_config(config_path(config))
     ensure_dirs(cfg)
     return cfg, KB(cfg["storage"]["duckdb_path"])
 
 
 def run_named_stage(name: str, config: Optional[str]) -> None:
+    from proofline.pipeline.runner import STAGES, resolve_stage, run_stage
+
     setup_logging()
     cfg = load_config(config_path(config))
     ensure_dirs(cfg)
@@ -243,6 +245,39 @@ def doctor(
 
 
 @app.command()
+def repair(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    bin_dir: Optional[str] = typer.Option(None, "--bin-dir", help="Directory for proofline/pfl links. Default: ~/.local/bin or PROOFLINE_BIN_DIR."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be repaired without changing files."),
+    skip_python_deps: bool = typer.Option(False, "--skip-python-deps", help="Skip reinstalling Proofline Python dependencies."),
+    skip_cgc: bool = typer.Option(False, "--skip-cgc", help="Skip CGC, SCIP, Docker, and Neo4j repair."),
+    skip_bin_links: bool = typer.Option(False, "--skip-bin-links", help="Skip relinking proofline/pfl into the bin directory."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Repair local dependencies, config directories, CGC, and local Neo4j Docker runtime."""
+    steps = run_repair(
+        config_path=config_path(config),
+        bin_dir=bin_dir,
+        dry_run=dry_run,
+        skip_python_deps=skip_python_deps,
+        skip_cgc=skip_cgc,
+        skip_bin_links=skip_bin_links,
+    )
+    if json_output:
+        typer.echo(json_dumps({"steps": steps, "ok": all(step["ok"] for step in steps)}))
+        if not all(step["ok"] for step in steps):
+            raise typer.Exit(1)
+        return
+    for step in steps:
+        marker = "ok" if step["ok"] else "failed"
+        color = "green" if step["ok"] else "red"
+        details = f": {step['details']}" if step.get("details") else ""
+        console.print(f"[{color}]{marker:7}[/{color}] {step['name']}: {step['action']}{details}")
+    if not all(step["ok"] for step in steps):
+        raise typer.Exit(1)
+
+
+@app.command()
 def version(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -336,6 +371,8 @@ def run(
     to_stage: Optional[str] = typer.Option(None, "--to"),
 ) -> None:
     """Run the main Proofline pipeline."""
+    from proofline.pipeline.runner import run_order
+
     run_order(config_path(config), from_stage, to_stage)
 
 
@@ -485,6 +522,8 @@ def ask(
     raw_trace: bool = typer.Option(False, "--raw-trace"),
     quiet: bool = typer.Option(False, "--quiet"),
 ) -> None:
+    from proofline.agent import ask as ask_commands
+
     ask_commands.ask(question, config_path(config), project, env, window_days, raw_context, raw_trace, quiet, agent_name)
 
 
@@ -497,6 +536,8 @@ def impact(
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
 ) -> None:
+    from proofline.agent import ask as ask_commands
+
     ask_commands.impact(project, feature, config_path(config), env, window_days, raw_context)
 
 
@@ -509,6 +550,8 @@ def data_source(
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
 ) -> None:
+    from proofline.agent import ask as ask_commands
+
     ask_commands.data_source(project, feature, config_path(config), env, window_days, raw_context)
 
 
@@ -520,6 +563,8 @@ def dependencies(
     window_days: Optional[int] = typer.Option(None, "--window-days"),
     raw_context: bool = typer.Option(False, "--raw-context"),
 ) -> None:
+    from proofline.agent import ask as ask_commands
+
     ask_commands.dependency_report(project, config_path(config), env, window_days, raw_context)
 
 
@@ -530,6 +575,8 @@ def search(
     repo: Optional[str] = typer.Option(None, "--repo", "--project", "-p"),
     limit: int = typer.Option(25, "--limit"),
 ) -> None:
+    from proofline.agent import ask as ask_commands
+
     ask_commands.search(query, config_path(config), repo, limit)
 
 
