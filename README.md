@@ -74,7 +74,9 @@ pip install -e .
 proofline init
 ```
 
-`proofline init` creates `proofline.yaml` from `proofline.example.yaml` and prepares local working directories.
+`proofline init` opens an interactive survey when run in a terminal, writes the selected core settings to `proofline.yaml`, and prepares local working directories. Use `proofline init --non-interactive` to write defaults without prompts.
+
+When a newer `pfl` sees an older local config, it automatically inserts missing top-level sections before the next known section, preserving existing values and user comments. Proofline prints a short note when it updates the config and flags enabled integrations that still need credentials or URLs.
 
 ## Configure
 
@@ -193,6 +195,7 @@ Useful stage aliases:
 
 ```text
 repos       -> repo_ingest
+history     -> git_history
 code        -> code_index
 api         -> api_surface
 runtime     -> datadog
@@ -323,6 +326,14 @@ Main tables:
 ```text
 repo_inventory
 repo_files
+git_commits
+git_file_changes
+git_patch_hunks
+git_detected_links
+git_reverts
+git_blame_current
+git_semantic_changes
+git_cochange_edges
 code_chunks
 code_embedding_index
 api_contracts

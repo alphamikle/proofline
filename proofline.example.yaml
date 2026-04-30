@@ -1,10 +1,12 @@
 # yaml-language-server: $schema=./config.schema.json
+config_version: 2
 workspace: ./data
 repos:
   root: ./repos
   # Optional: if present, pipeline can clone missing repos. One URL per line.
   clone_urls_file: null
   update_existing: true
+  max_workers: 1
   include_git_history_metadata: true
   max_file_mb: 5
   exclude_dirs:
@@ -64,6 +66,24 @@ storage:
   sqlite_fts_path: ./data/indexes/code_fts.sqlite
   vector_index_path: ./data/indexes/code_vectors.faiss
   vector_meta_path: ./data/indexes/code_vectors_meta.parquet
+
+git_history:
+  enabled: true
+  # null or omitted means index the full reachable history in the selected scope.
+  max_commits_per_repo: null
+  metadata_days: null
+  rename_detection: true
+  patch_hunks: true
+  current_blame: true
+  use_blame_ignore_revs: true
+  write_commit_graph: true
+  cochange_window_days: 730
+  cochange_min_count: 1
+  max_hunk_chars: 20000
+  max_blame_files: 500
+  max_blame_rows: 50000
+  git_timeout_seconds: 300
+  max_workers: 1
 
 datadog:
   enabled: true
@@ -173,13 +193,31 @@ jira:
 
 indexing:
   lexical_fts: true
+  chunk_write_batch_size: 5000
+  max_workers: 1
   embeddings:
     enabled: true
+    # sentence_transformers | openai | openai_compatible | cli
     provider: sentence_transformers
     model_name: Qwen/Qwen3-Embedding-0.6B
+    model_id: null
+    # External providers use the same style as agent:
+    # base_url: http://localhost:11434/v1
+    # api_key_env: OPENAI_API_KEY
+    # command: null
+    base_url: null
+    base_url_env: null
+    api_key_env: OPENAI_API_KEY
+    command: null
     # auto uses MPS/CUDA when available, otherwise CPU.
     device: auto
     batch_size: 4
+    max_workers: 1
+    dimensions: null
+    normalize_embeddings: true
+    request_timeout_seconds: 600
+    # null stores per-repo FAISS/parquet shards next to vector_index_path.
+    shard_dir: null
     max_chunks: null
     min_text_chars: 80
     max_text_chars: 4096
@@ -214,6 +252,8 @@ code_graph:
   command: "$HOME/.local/bin/cgc index {repo_path}"
   query_command: "$HOME/.local/bin/cgc"
   timeout_seconds: 300
+  max_workers: 1
+  retries: 0
   import:
     enabled: true
     page_size: 5000

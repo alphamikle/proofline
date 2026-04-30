@@ -45,6 +45,68 @@ class KB:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS git_commits (
+              repo_id TEXT, commit_sha TEXT, parent_shas TEXT,
+              author_name TEXT, author_email TEXT, committer_name TEXT,
+              committer_email TEXT, author_time TEXT, commit_time TEXT,
+              subject TEXT, body TEXT, is_merge BOOLEAN, is_revert BOOLEAN,
+              is_hotfix BOOLEAN, reverts_commit_sha TEXT,
+              detected_jira_keys TEXT, detected_urls TEXT, indexed_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_file_changes (
+              repo_id TEXT, commit_sha TEXT, old_path TEXT, new_path TEXT,
+              change_type TEXT, added_lines BIGINT, deleted_lines BIGINT,
+              is_rename BOOLEAN, rename_score INTEGER, is_copy BOOLEAN,
+              is_binary BOOLEAN, file_extension TEXT, file_category TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_patch_hunks (
+              repo_id TEXT, commit_sha TEXT, file_path TEXT, hunk_id TEXT,
+              old_start INTEGER, old_lines INTEGER, new_start INTEGER,
+              new_lines INTEGER, hunk_header TEXT, added_text TEXT,
+              removed_text TEXT, context_text TEXT, classification TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_detected_links (
+              repo_id TEXT, commit_sha TEXT, link_type TEXT, target TEXT,
+              source_text TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_reverts (
+              repo_id TEXT, revert_commit_sha TEXT, reverted_commit_sha TEXT,
+              confidence DOUBLE, evidence TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_blame_current (
+              repo_id TEXT, file_path TEXT, line_start INTEGER, line_end INTEGER,
+              symbol_id TEXT, last_commit_sha TEXT, last_author_email TEXT,
+              last_commit_time TEXT, ignored_revs_applied BOOLEAN
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_semantic_changes (
+              repo_id TEXT, service_id TEXT, commit_sha TEXT, change_type TEXT,
+              entity_type TEXT, entity_id TEXT, before_value TEXT,
+              after_value TEXT, breaking_risk TEXT, confidence DOUBLE,
+              evidence_id TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS git_cochange_edges (
+              from_entity TEXT, to_entity TEXT, entity_type TEXT,
+              cochange_type TEXT, same_commit_count BIGINT,
+              same_pr_count BIGINT, same_jira_count BIGINT,
+              same_release_count BIGINT, last_cochanged_at TEXT,
+              window_days INTEGER, confidence DOUBLE
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS ownership (
               entity_id TEXT, entity_type TEXT, owner_team TEXT, owner_people TEXT,
               source TEXT, confidence DOUBLE, evidence_ref TEXT
@@ -58,11 +120,33 @@ class KB:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS code_index_repo_status (
+              repo_id TEXT, source_fingerprint TEXT, status TEXT,
+              file_count BIGINT, chunk_count BIGINT,
+              started_at TEXT, finished_at TEXT, details TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_index_file_status (
+              repo_id TEXT, rel_path TEXT, file_fingerprint TEXT,
+              status TEXT, chunk_count BIGINT, indexed_at TEXT,
+              details TEXT
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS code_embedding_index (
               faiss_id BIGINT, chunk_id TEXT, repo_id TEXT, rel_path TEXT,
               language TEXT, kind TEXT, symbol TEXT, start_line INTEGER,
               end_line INTEGER, text_sha1 TEXT, model_name TEXT, vector_dim INTEGER,
               embedded_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_embedding_repo_status (
+              repo_id TEXT, model_name TEXT, source_fingerprint TEXT, status TEXT,
+              chunk_count BIGINT, vector_count BIGINT, vector_dim INTEGER,
+              started_at TEXT, finished_at TEXT, index_path TEXT,
+              meta_path TEXT, details TEXT
             )
             """,
             """
@@ -241,6 +325,13 @@ class KB:
             """
             CREATE TABLE IF NOT EXISTS pipeline_runs (
               stage TEXT, started_at TEXT, finished_at TEXT, status TEXT, details TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS pipeline_repo_status (
+              stage TEXT, repo_id TEXT, fingerprint TEXT, status TEXT,
+              started_at TEXT, finished_at TEXT, item_count BIGINT,
+              details TEXT
             )
             """,
         ]

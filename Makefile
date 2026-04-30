@@ -1,13 +1,15 @@
 PYTHON ?= .venv/bin/python
 CONFIG ?= proofline.yaml
 
-.PHONY: bootstrap full repo code embeddings api code-graph static datadog bigquery confluence jira graph endpoint capabilities publish smoke
+.PHONY: bootstrap full repo history code embeddings api code-graph static datadog bigquery confluence jira graph endpoint capabilities publish smoke
 bootstrap:
 	$(PYTHON) -m proofline bootstrap
 full:
 	$(PYTHON) -m proofline run --config $(CONFIG)
 repo:
 	$(PYTHON) -m proofline stage repos --config $(CONFIG)
+history:
+	$(PYTHON) -m proofline stage history --config $(CONFIG)
 code:
 	$(PYTHON) -m proofline build code --config $(CONFIG)
 embeddings:

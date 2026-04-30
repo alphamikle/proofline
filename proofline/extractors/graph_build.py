@@ -20,6 +20,10 @@ def build_graph(
     ownership: pd.DataFrame,
     code_graph_symbols: pd.DataFrame | None = None,
     code_graph_edges: pd.DataFrame | None = None,
+    git_commits: pd.DataFrame | None = None,
+    git_file_changes: pd.DataFrame | None = None,
+    git_semantic_changes: pd.DataFrame | None = None,
+    git_cochange_edges: pd.DataFrame | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
@@ -164,6 +168,75 @@ def build_graph(
                 ev_refs=[ev_id],
                 edge_id_override=str(e.get("edge_id") or ""),
             )
+    if git_commits is not None and not git_commits.empty:
+        for _, c in git_commits.iterrows():
+            sha = str(c.get("commit_sha") or "")
+            repo_id = str(c.get("repo_id") or "")
+            if not sha:
+                continue
+            commit_node = f"commit:{sha}"
+            author = str(c.get("author_email") or c.get("author_name") or "")
+            add_node(commit_node, "commit", sha[:12], "git_history", 0.85, {
+                "repo_id": repo_id,
+                "subject": c.get("subject"),
+                "commit_time": c.get("commit_time"),
+                "is_revert": c.get("is_revert"),
+                "is_hotfix": c.get("is_hotfix"),
+            })
+            if repo_id:
+                add_edge(f"repo:{repo_id}", commit_node, "HAS_COMMIT", "git_history", 0.75, last_seen=str(c.get("commit_time") or ""))
+            if author:
+                person_node = f"person:{author}"
+                add_node(person_node, "person", author, "git_history", 0.65)
+                add_edge(person_node, commit_node, "AUTHORED", "git_history", 0.8, last_seen=str(c.get("commit_time") or ""))
+            target = str(c.get("reverts_commit_sha") or "")
+            if target:
+                add_edge(commit_node, f"commit:{target}", "REVERTS", "git_history", 0.9, last_seen=str(c.get("commit_time") or ""))
+    if git_file_changes is not None and not git_file_changes.empty:
+        for _, fc in git_file_changes.iterrows():
+            repo_id = str(fc.get("repo_id") or "")
+            path = str(fc.get("new_path") or fc.get("old_path") or "")
+            sha = str(fc.get("commit_sha") or "")
+            if not repo_id or not path or not sha:
+                continue
+            file_node = f"file:{repo_id}:{path}"
+            add_node(file_node, "file", path, "git_history", 0.65, {"repo_id": repo_id, "file_category": fc.get("file_category")})
+            add_edge(f"commit:{sha}", file_node, "TOUCHED_FILE", "git_history", 0.75, props={
+                "change_type": fc.get("change_type"),
+                "added_lines": fc.get("added_lines"),
+                "deleted_lines": fc.get("deleted_lines"),
+                "is_rename": fc.get("is_rename"),
+            })
+    if git_semantic_changes is not None and not git_semantic_changes.empty:
+        for _, sc in git_semantic_changes.iterrows():
+            entity_type = str(sc.get("entity_type") or "change_entity")
+            entity_id = str(sc.get("entity_id") or "")
+            sha = str(sc.get("commit_sha") or "")
+            if not entity_id or not sha:
+                continue
+            node_id = f"{entity_type}:{entity_id}"
+            add_node(node_id, entity_type, entity_id, "git_semantic_change", float(sc.get("confidence") or 0.45), {
+                "repo_id": sc.get("repo_id"),
+                "breaking_risk": sc.get("breaking_risk"),
+            })
+            add_edge(f"commit:{sha}", node_id, str(sc.get("change_type") or "CHANGED"), "git_semantic_change", float(sc.get("confidence") or 0.45), props={
+                "before": sc.get("before_value"),
+                "after": sc.get("after_value"),
+                "breaking_risk": sc.get("breaking_risk"),
+                "evidence_id": sc.get("evidence_id"),
+            })
+    if git_cochange_edges is not None and not git_cochange_edges.empty:
+        for _, ce in git_cochange_edges.iterrows():
+            from_node = str(ce.get("from_entity") or "")
+            to_node = str(ce.get("to_entity") or "")
+            if not from_node or not to_node:
+                continue
+            add_edge(from_node, to_node, "CO_CHANGED_WITH", "git_history", float(ce.get("confidence") or 0.3), last_seen=str(ce.get("last_cochanged_at") or ""), props={
+                "same_commit_count": ce.get("same_commit_count"),
+                "same_jira_count": ce.get("same_jira_count"),
+                "window_days": ce.get("window_days"),
+                "entity_type": ce.get("entity_type"),
+            })
     known_nodes = {str(n.get("node_id") or "") for n in nodes}
     for e in list(edges):
         for endpoint_key in ["from_node", "to_node"]:

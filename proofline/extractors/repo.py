@@ -66,6 +66,24 @@ def file_sha1(path: Path) -> str:
 def iter_files(repo: Path, exclude_dirs: Iterable[str], max_file_mb: float) -> Iterator[Path]:
     excludes = set(exclude_dirs)
     max_bytes = int(max_file_mb * 1024 * 1024)
+    try:
+        tracked = run_cmd(["git", "ls-files", "-z"], cwd=repo, timeout=120)
+    except Exception:
+        tracked = ""
+    if tracked:
+        for rel in tracked.split("\0"):
+            if not rel:
+                continue
+            p = repo / rel
+            parts = set(Path(rel).parts)
+            if parts & excludes:
+                continue
+            try:
+                if p.is_file() and p.stat().st_size <= max_bytes:
+                    yield p
+            except Exception:
+                continue
+        return
     for dirpath, dirnames, filenames in os.walk(repo):
         dirnames[:] = [d for d in dirnames if d not in excludes and not d.startswith(".") or d == ".github"]
         for name in filenames:
@@ -75,6 +93,15 @@ def iter_files(repo: Path, exclude_dirs: Iterable[str], max_file_mb: float) -> I
                     yield p
             except Exception:
                 continue
+
+
+def repo_source_fingerprint(repo: Path, cfg: Dict[str, Any]) -> str:
+    head = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo)
+    files = run_cmd(["git", "ls-files", "-s"], cwd=repo, timeout=120)
+    max_file_mb = str(cfg.get("repos", {}).get("max_file_mb", ""))
+    includes = ",".join(cfg.get("repos", {}).get("include_extensions", []) or [])
+    excludes = ",".join(cfg.get("repos", {}).get("exclude_dirs", []) or [])
+    return hashlib.sha1(f"{head}\n{max_file_mb}\n{includes}\n{excludes}\n{files}".encode("utf-8", errors="ignore")).hexdigest()
 
 
 def detect_kind(path: Path, rel: str) -> str:
@@ -116,13 +143,28 @@ def classify_repo(files: List[Dict[str, Any]], languages: Counter) -> str:
     return "unknown"
 
 
-def scan_repo(repo: Path, cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def scan_repo(
+    repo: Path,
+    cfg: Dict[str, Any],
+    *,
+    progress_desc: str | None = None,
+    progress_position: int = 1,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     repo_id = repo_id_from_path(repo)
     exclude_dirs = cfg["repos"].get("exclude_dirs", [])
     max_file_mb = float(cfg["repos"].get("max_file_mb", 2))
     files: List[Dict[str, Any]] = []
     language_counts: Counter = Counter()
-    for path in iter_files(repo, exclude_dirs, max_file_mb):
+    paths: Iterable[Path] = iter_files(repo, exclude_dirs, max_file_mb)
+    if progress_desc:
+        try:
+            from tqdm.auto import tqdm
+
+            path_list = list(paths)
+            paths = tqdm(path_list, total=len(path_list), desc=progress_desc, unit="file", position=progress_position, leave=False)
+        except Exception:
+            paths = iter_files(repo, exclude_dirs, max_file_mb)
+    for path in paths:
         rel = str(path.relative_to(repo))
         ext = path.suffix.lower() or path.name
         lang = EXT_LANG.get(ext)

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import typer
+import yaml
 
 from proofline.agent import ask as ask_commands
-from proofline.config import CONFIG_ENV_VAR, DEFAULT_CONFIG, ensure_dirs, load_config
+from proofline.config import CONFIG_ENV_VAR, DEFAULT_CONFIG, config_followup_warnings, default_config, ensure_dirs, load_config, migrate_config_file
 from proofline.logging_utils import console, setup_logging
 from proofline.pipeline.runner import STAGES, resolve_stage, run_order, run_stage
 from proofline.storage import KB
@@ -95,18 +95,112 @@ def run_script(script_name: str, config: Optional[str], dry_run: bool = False) -
 def init(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     force: bool = typer.Option(False, "--force"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", "--yes", help="Write defaults without the interactive survey."),
+    migrate: bool = typer.Option(False, "--migrate", help="Update an existing config in place instead of failing when it exists."),
 ) -> None:
-    """Create a proofline.yaml config and local working directories."""
+    """Create or update a proofline.yaml config and local working directories."""
     target = Path(config_path(config))
     if target.exists() and not force:
-        raise typer.BadParameter(f"{target} already exists. Pass --force to overwrite it.")
-    example = Path(__file__).resolve().parents[1] / "proofline.example.yaml"
-    if not example.exists():
-        raise typer.BadParameter(f"Template not found: {example}")
-    shutil.copyfile(example, target)
+        if migrate:
+            cfg, added = migrate_config_file(target)
+            ensure_dirs(load_config(target))
+            if added:
+                console.print(f"[green]Updated[/green] {target} with {len(added)} missing config keys.")
+            else:
+                console.print(f"[green]Already up to date[/green] {target}")
+            warnings = config_followup_warnings(cfg)
+            for warning in warnings:
+                console.print(f"[yellow]Needs attention:[/yellow] {warning}")
+            return
+        raise typer.BadParameter(f"{target} already exists. Pass --migrate to update it or --force to overwrite it.")
+    cfg = default_config()
+    interactive = (not non_interactive) and sys.stdin.isatty()
+    if interactive:
+        cfg = survey_config(cfg, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=False)
     cfg = load_config(target)
     ensure_dirs(cfg)
     console.print(f"Created {target}")
+    warnings = config_followup_warnings(cfg)
+    for warning in warnings:
+        console.print(f"[yellow]Needs attention:[/yellow] {warning}")
+
+
+def survey_config(cfg: dict[str, Any], target: Path) -> dict[str, Any]:
+    console.print("[bold]Proofline config survey[/bold]")
+    console.print(f"Target: {target}")
+
+    console.print("\n[bold]Workspace[/bold]")
+    cfg["workspace"] = typer.prompt("Workspace directory", default=str(cfg.get("workspace") or "./data"))
+    cfg.setdefault("repos", {})
+    cfg["repos"]["root"] = typer.prompt("Repositories directory", default=str(cfg["repos"].get("root") or "./repos"))
+    cfg["repos"]["update_existing"] = typer.confirm("Fetch/update existing repos during sync?", default=bool(cfg["repos"].get("update_existing", True)))
+    max_file_mb = typer.prompt("Max file size to index, MB", default=str(cfg["repos"].get("max_file_mb", 5)))
+    cfg["repos"]["max_file_mb"] = float(max_file_mb)
+
+    root = Path(cfg["workspace"])
+    cfg.setdefault("storage", {})
+    cfg["storage"]["duckdb_path"] = typer.prompt("DuckDB path", default=str(root / "kb.duckdb"))
+    cfg["storage"]["sqlite_fts_path"] = typer.prompt("SQLite FTS path", default=str(root / "indexes" / "code_fts.sqlite"))
+    cfg["storage"]["vector_index_path"] = typer.prompt("Vector index path", default=str(root / "indexes" / "code_vectors.faiss"))
+    cfg["storage"]["vector_meta_path"] = typer.prompt("Vector metadata path", default=str(root / "indexes" / "code_vectors_meta.parquet"))
+
+    console.print("\n[bold]Git History[/bold]")
+    cfg.setdefault("git_history", {})
+    gh = cfg["git_history"]
+    gh["enabled"] = typer.confirm("Index Git history as Change Graph?", default=bool(gh.get("enabled", True)))
+    gh["patch_hunks"] = typer.confirm("Index patch hunks?", default=bool(gh.get("patch_hunks", True)))
+    gh["current_blame"] = typer.confirm("Build current blame index?", default=bool(gh.get("current_blame", True)))
+    full_history = typer.confirm("Index full Git history? Choose no to set a commit limit.", default=gh.get("max_commits_per_repo") in (None, ""))
+    gh["max_commits_per_repo"] = None if full_history else int(typer.prompt("Max commits per repo", default="5000"))
+    gh["cochange_window_days"] = int(typer.prompt("Co-change window, days", default=str(gh.get("cochange_window_days") or 730)))
+
+    console.print("\n[bold]Sources[/bold]")
+    configure_source(cfg, "datadog", "Enable Datadog runtime ingestion?")
+    configure_source(cfg, "bigquery", "Enable BigQuery metadata ingestion?")
+    configure_source(cfg, "confluence", "Enable Confluence ingestion?")
+    configure_source(cfg, "jira", "Enable Jira ingestion?")
+    if cfg.get("datadog", {}).get("enabled"):
+        cfg["datadog"]["site"] = typer.prompt("Datadog site", default=str(cfg["datadog"].get("site") or "datadoghq.com"))
+    for key, label in [("confluence", "Confluence base URL"), ("jira", "Jira base URL")]:
+        if cfg.get(key, {}).get("enabled"):
+            default_url = str(cfg[key].get("base_url") or f"${{{key.upper()}_BASE_URL}}")
+            cfg[key]["base_url"] = typer.prompt(label, default=default_url)
+
+    console.print("\n[bold]Indexes[/bold]")
+    cfg.setdefault("indexing", {}).setdefault("embeddings", {})
+    cfg["indexing"]["lexical_fts"] = typer.confirm("Build lexical full-text search index?", default=bool(cfg["indexing"].get("lexical_fts", True)))
+    emb = cfg["indexing"]["embeddings"]
+    emb["enabled"] = typer.confirm("Build vector embeddings?", default=bool(emb.get("enabled", True)))
+    if emb["enabled"]:
+        emb["provider"] = typer.prompt("Embedding provider (sentence_transformers, openai, openai_compatible, cli)", default=str(emb.get("provider") or "sentence_transformers"))
+        emb["model_name"] = typer.prompt("Embedding model", default=str(emb.get("model_name") or "Qwen/Qwen3-Embedding-0.6B"))
+        if emb["provider"] == "sentence_transformers":
+            emb["device"] = typer.prompt("Embedding device", default=str(emb.get("device") or "auto"))
+        elif emb["provider"] in {"openai", "openai_compatible"}:
+            emb["base_url"] = typer.prompt("Embedding base URL", default=str(emb.get("base_url") or ("https://api.openai.com/v1" if emb["provider"] == "openai" else "${OPENAI_BASE_URL}")))
+            emb["api_key_env"] = typer.prompt("Embedding API key env", default=str(emb.get("api_key_env") or "OPENAI_API_KEY"))
+        elif emb["provider"] == "cli":
+            emb["command"] = typer.prompt("Embedding command", default=str(emb.get("command") or ""))
+
+    console.print("\n[bold]Graph & Agent[/bold]")
+    cfg.setdefault("graph_backend", {})
+    cfg["graph_backend"]["enabled"] = typer.confirm("Enable external Neo4j graph backend?", default=bool(cfg["graph_backend"].get("enabled", True)))
+    if cfg["graph_backend"]["enabled"]:
+        cfg["graph_backend"]["uri"] = typer.prompt("Neo4j URI", default=str(cfg["graph_backend"].get("uri") or "bolt://localhost:7687"))
+        cfg["graph_backend"]["username"] = typer.prompt("Neo4j username", default=str(cfg["graph_backend"].get("username") or "neo4j"))
+    cfg.setdefault("agent", {})
+    cfg["agent"]["provider"] = typer.prompt("Agent provider (none, cli, openai, openai_compatible, anthropic, anthropic_compatible)", default=str(cfg["agent"].get("provider") or "none"))
+    if cfg["agent"]["provider"] != "none":
+        cfg["agent"]["model"] = typer.prompt("Agent model", default=str(cfg["agent"].get("model") or ""))
+    return cfg
+
+
+def configure_source(cfg: dict[str, Any], key: str, prompt: str) -> None:
+    cfg.setdefault(key, {})
+    cfg[key]["enabled"] = typer.confirm(prompt, default=bool(cfg[key].get("enabled", False)))
 
 
 @app.command()
@@ -190,7 +284,10 @@ def build(
     """Build local indexes, entity resolution, graph, and capability maps."""
     selected = (target or "all").replace("-", "_")
     groups = {
-        "all": ["code", "embeddings", "api", "code-graph", "static", "identity", "graph", "endpoints", "capabilities"],
+        "all": ["history", "blame", "code", "embeddings", "api", "code-graph", "static", "identity", "graph", "endpoints", "capabilities"],
+        "history": ["history"],
+        "change_history": ["history"],
+        "blame": ["blame"],
         "code": ["code"],
         "embeddings": ["embeddings"],
         "api": ["api"],
@@ -224,9 +321,17 @@ def status(
         tables = [
             "repo_inventory",
             "repo_files",
+            "git_commits",
+            "git_file_changes",
+            "git_semantic_changes",
+            "git_cochange_edges",
             "code_chunks",
+            "code_index_repo_status",
             "api_endpoints",
             "service_identity",
+            "code_embedding_index",
+            "code_embedding_repo_status",
+            "pipeline_repo_status",
             "nodes",
             "edges",
             "endpoint_dependency_map",

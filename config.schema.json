@@ -11,6 +11,11 @@
       "description": "Workspace directory for generated data, indexes, and reports.",
       "default": "./data"
     },
+    "config_version": {
+      "type": "integer",
+      "description": "Internal configuration shape version used for automatic migrations.",
+      "default": 2
+    },
     "repos": {
       "type": "object",
       "additionalProperties": false,
@@ -29,6 +34,7 @@
           "description": "Fetch and pull repositories that already exist under repos.root.",
           "default": true
         },
+        "max_workers": { "$ref": "#/definitions/positiveInteger" },
         "include_git_history_metadata": {
           "type": "boolean",
           "description": "Collect lightweight Git history metadata during repository scan.",
@@ -60,6 +66,35 @@
         "sqlite_fts_path": { "$ref": "#/definitions/stringPath" },
         "vector_index_path": { "$ref": "#/definitions/stringPath" },
         "vector_meta_path": { "$ref": "#/definitions/stringPath" }
+      }
+    },
+    "git_history": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "metadata_days": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional history window. Null or omitted indexes all reachable history."
+        },
+        "max_commits_per_repo": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional safety limit. Null or omitted indexes all commits in scope."
+        },
+        "rename_detection": { "type": "boolean", "default": true },
+        "patch_hunks": { "type": "boolean", "default": true },
+        "current_blame": { "type": "boolean", "default": true },
+        "use_blame_ignore_revs": { "type": "boolean", "default": true },
+        "write_commit_graph": { "type": "boolean", "default": true },
+        "cochange_window_days": { "$ref": "#/definitions/nullablePositiveInteger" },
+        "cochange_min_count": { "$ref": "#/definitions/positiveInteger" },
+        "max_hunk_chars": { "$ref": "#/definitions/positiveInteger" },
+        "max_blame_files": { "$ref": "#/definitions/positiveInteger" },
+        "max_blame_rows": { "$ref": "#/definitions/positiveInteger" },
+        "git_timeout_seconds": { "$ref": "#/definitions/positiveInteger" },
+        "max_workers": { "$ref": "#/definitions/positiveInteger" }
       }
     },
     "datadog": {
@@ -153,6 +188,8 @@
       "additionalProperties": false,
       "properties": {
         "lexical_fts": { "type": "boolean", "default": true },
+        "chunk_write_batch_size": { "$ref": "#/definitions/positiveInteger" },
+        "max_workers": { "$ref": "#/definitions/positiveInteger" },
         "embeddings": {
           "type": "object",
           "additionalProperties": false,
@@ -160,16 +197,41 @@
             "enabled": { "type": "boolean", "default": true },
             "provider": {
               "type": "string",
-              "enum": ["sentence_transformers"],
+              "enum": ["sentence_transformers", "openai", "openai_compatible", "cli"],
               "default": "sentence_transformers"
             },
             "model_name": { "type": "string" },
+            "model_id": {
+              "type": ["string", "null"],
+              "description": "Optional stable identity stored with vector shards. Use when an external endpoint aliases or changes models."
+            },
+            "base_url": {
+              "type": ["string", "null"],
+              "description": "Base URL for OpenAI-compatible embedding APIs."
+            },
+            "base_url_env": {
+              "type": ["string", "null"],
+              "description": "Environment variable containing the embedding API base URL."
+            },
+            "api_key_env": {
+              "type": ["string", "null"],
+              "description": "Environment variable containing the embedding API key."
+            },
+            "command": {
+              "type": ["string", "null"],
+              "description": "Command for provider=cli. Receives JSON on stdin and returns embeddings JSON on stdout."
+            },
             "device": {
               "type": "string",
               "description": "Embedding device: auto, cpu, cuda, mps, or another device string accepted by sentence-transformers.",
               "default": "auto"
             },
             "batch_size": { "$ref": "#/definitions/positiveInteger" },
+            "max_workers": { "$ref": "#/definitions/positiveInteger" },
+            "dimensions": { "$ref": "#/definitions/nullablePositiveInteger" },
+            "normalize_embeddings": { "type": "boolean", "default": true },
+            "request_timeout_seconds": { "$ref": "#/definitions/positiveInteger" },
+            "shard_dir": { "$ref": "#/definitions/nullableStringPath" },
             "max_chunks": { "$ref": "#/definitions/nullablePositiveInteger" },
             "min_text_chars": { "$ref": "#/definitions/nonNegativeInteger" },
             "max_text_chars": { "$ref": "#/definitions/positiveInteger" },
@@ -250,7 +312,9 @@
             "max_edges": { "$ref": "#/definitions/nullablePositiveInteger" }
           }
         },
-        "max_repos": { "$ref": "#/definitions/nullablePositiveInteger" }
+        "max_repos": { "$ref": "#/definitions/nullablePositiveInteger" },
+        "max_workers": { "$ref": "#/definitions/positiveInteger" },
+        "retries": { "$ref": "#/definitions/nonNegativeInteger" }
       }
     },
     "agent": {

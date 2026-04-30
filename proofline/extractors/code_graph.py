@@ -5,6 +5,8 @@ import os
 import re
 import shlex
 import subprocess
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -39,29 +41,70 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     rows: List[Dict[str, Any]] = []
     timeout_seconds = int(cg.get("timeout_seconds", 1800))
-    for index, repo in repos.reset_index(drop=True).iterrows():
-        started = now_iso()
+    max_workers = max(1, int(cg.get("max_workers") or 1))
+    retries = max(0, int(cg.get("retries") or 0))
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
+    pending = []
+    for _, repo in repos.reset_index(drop=True).iterrows():
         repo_id = str(repo.get("repo_id") or "")
         repo_path = str(repo.get("repo_path") or "")
         command = os.path.expandvars(command_template.format(repo_id=shlex.quote(repo_id), repo_path=shlex.quote(repo_path)))
-        console.print(f"code graph [{index + 1}/{len(repos)}]: {repo_id}", highlight=False)
+        fingerprint = _code_graph_fingerprint(repo_id, repo_path, command)
+        existing = kb.query_df(
+            """
+            SELECT status, fingerprint
+            FROM pipeline_repo_status
+            WHERE stage = 'code_graph' AND repo_id = ?
+            LIMIT 1
+            """,
+            [repo_id],
+        )
+        if not existing.empty and str(existing.iloc[0].get("status") or "") == "ok" and str(existing.iloc[0].get("fingerprint") or "") == fingerprint:
+            rows.append({
+                "repo_id": repo_id,
+                "repo_path": repo_path,
+                "status": "cached",
+                "started_at": now_iso(),
+                "finished_at": now_iso(),
+                "command": command,
+                "details": "",
+            })
+            continue
+        pending.append((repo_id, repo_path, command, fingerprint))
+
+    def run_one(item: tuple[str, str, str, str]) -> Dict[str, Any]:
+        repo_id, repo_path, command, fingerprint = item
+        started = now_iso()
+        if not tqdm:
+            console.print(f"code graph: {repo_id}", highlight=False)
+        status = "error"
+        details = ""
         try:
-            p = subprocess.run(
-                shlex.split(command),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout_seconds,
-            )
-            status = "ok" if p.returncode == 0 else "error"
-            details = (p.stdout + "\n" + p.stderr).strip()[:4000]
+            attempts: Iterable[int] = range(retries + 1)
+            if tqdm and max_workers == 1:
+                attempts = tqdm(attempts, total=retries + 1, desc=f"Code graph {repo_id}", unit="try", position=1, leave=False)
+            for attempt in attempts:
+                p = subprocess.run(
+                    shlex.split(command),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+                status = "ok" if p.returncode == 0 else "error"
+                details = (p.stdout + "\n" + p.stderr).strip()[:4000]
+                if status == "ok" or attempt >= retries:
+                    break
         except subprocess.TimeoutExpired as e:
             status = "timeout"
             details = f"timed out after {timeout_seconds}s: {e}"
         except Exception as e:
             status = "error"
             details = str(e)
-        row = {
+        return {
             "repo_id": repo_id,
             "repo_path": repo_path,
             "status": status,
@@ -69,14 +112,60 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
             "finished_at": now_iso(),
             "command": command,
             "details": details,
+            "_fingerprint": fingerprint,
         }
-        rows.append(row)
-        try:
-            kb.append_df("code_graph_runs", pd.DataFrame([row]))
-        except Exception:
-            pass
-        console.print(f"code graph [{index + 1}/{len(repos)}]: {repo_id} -> {status}", highlight=False)
-    return pd.DataFrame(rows)
+
+    if max_workers > 1 and len(pending) > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(run_one, item) for item in pending]
+            iterator: Iterable[Any] = as_completed(futures)
+            if tqdm:
+                iterator = tqdm(iterator, total=len(futures), desc="Indexing code graph", unit="repo", position=0)
+            for future in iterator:
+                row = future.result()
+                rows.append(row)
+                _record_code_graph_run(kb, row, quiet=bool(tqdm))
+    else:
+        iterator = pending
+        if tqdm:
+            iterator = tqdm(iterator, total=len(pending), desc="Indexing code graph", unit="repo", position=0)
+        for item in iterator:
+            row = run_one(item)
+            rows.append(row)
+            _record_code_graph_run(kb, row, quiet=bool(tqdm))
+    return pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in rows])
+
+
+def _record_code_graph_run(kb, row: Dict[str, Any], *, quiet: bool = False) -> None:
+    fingerprint = str(row.get("_fingerprint") or "")
+    repo_id = str(row.get("repo_id") or "")
+    status = str(row.get("status") or "")
+    public_row = {k: v for k, v in row.items() if not k.startswith("_")}
+    try:
+        kb.append_df("code_graph_runs", pd.DataFrame([public_row]))
+        kb.execute("DELETE FROM pipeline_repo_status WHERE stage = 'code_graph' AND repo_id = ?", [repo_id])
+        kb.append_df("pipeline_repo_status", pd.DataFrame([{
+            "stage": "code_graph",
+            "repo_id": repo_id,
+            "fingerprint": fingerprint,
+            "status": status,
+            "started_at": row.get("started_at") or "",
+            "finished_at": row.get("finished_at") or "",
+            "item_count": 1 if status == "ok" else 0,
+            "details": str(row.get("details") or "")[:4000],
+        }]))
+    except Exception:
+        pass
+    if not quiet:
+        console.print(f"code graph: {repo_id} -> {status}", highlight=False)
+
+
+def _code_graph_fingerprint(repo_id: str, repo_path: str, command: str) -> str:
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_path, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30).stdout.strip()
+    except Exception:
+        head = ""
+    return hashlib.sha1(f"{repo_id}\n{repo_path}\n{head}\n{command}".encode("utf-8", errors="ignore")).hexdigest()
 
 
 def import_code_graph(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:

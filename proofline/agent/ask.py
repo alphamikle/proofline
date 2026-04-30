@@ -91,6 +91,7 @@ def build_impact_context(tools: KBTools, project: str, feature: str, env: str, w
         "capabilities": tools.search_capabilities(feature, limit=30),
         "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=150),
         "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=150) if repo_id else {},
+        "change_history": tools.get_change_history(sid, feature, limit=60),
         "code_graph": tools.search_code_graph(feature, repo_id=repo_id, limit=40),
         "code_hits": tools.search_code(
             feature,
@@ -115,6 +116,7 @@ def build_data_source_context(tools: KBTools, project: str, feature: str, env: s
         "capabilities": tools.search_capabilities(feature, limit=50),
         "dependencies": tools.get_service_dependencies(sid, env, window_days),
         "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=150),
+        "change_history": tools.get_change_history(sid, feature, limit=60),
         "code_graph": tools.search_code_graph(feature, repo_id=repo_id, limit=40),
         "code_hits": tools.search_code(feature, repo_id=None, limit=30),
     }
@@ -137,6 +139,7 @@ def build_dependency_context(tools: KBTools, project: str, env: str, window_days
         "bq_usage": tools.get_bq_usage(sid, window_days),
         "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=200),
         "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=200) if repo_id else {},
+        "change_history": tools.get_change_history(sid, project, limit=80),
         "code_graph": tools.search_code_graph(project, repo_id=repo_id, limit=50),
     }
 
@@ -188,6 +191,7 @@ def ask(
                 "project": resolved,
                 "graph_neighborhood": tools.get_graph_neighborhood(f"service:{sid}", limit=100) if sid else {},
                 "repo_graph_neighborhood": tools.get_graph_neighborhood(f"repo:{repo_id}", limit=100) if repo_id else {},
+                "change_history": tools.get_change_history(sid, question, limit=40) if sid else {},
                 "capabilities": tools.search_capabilities(question, limit=25),
                 "code_graph": tools.search_code_graph(question, repo_id=repo_id, limit=40),
                 "code_hits": tools.search_code(question, repo_id=repo_id, limit=25),

@@ -30,25 +30,23 @@ def publish_graph_backend(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
             "evidence_count": 0, "status": "disabled", "details": "",
         }])
 
-    try:
-        from neo4j import GraphDatabase
-    except Exception as e:
-        raise RuntimeError(
-            "Graph publishing is enabled, but the neo4j Python package is missing. "
-            "Run: ./scripts/bootstrap.sh"
-        ) from e
-
     nodes = kb.query_df("SELECT * FROM nodes")
     edges = kb.query_df("SELECT * FROM edges")
     evidence = kb.query_df("SELECT * FROM evidence")
     batch_size = int(neo.get("batch_size", 1000))
 
-    driver = GraphDatabase.driver(
-        neo.get("uri", "bolt://localhost:7687"),
-        auth=(neo.get("username", "neo4j"), neo.get("password", "")),
-    )
-    database = neo.get("database", "neo4j")
     try:
+        from neo4j import GraphDatabase
+    except Exception as e:
+        return _publish_error(nodes, edges, evidence, f"neo4j package is missing: {e}")
+
+    driver = None
+    try:
+        driver = GraphDatabase.driver(
+            neo.get("uri", "bolt://localhost:7687"),
+            auth=(neo.get("username", "neo4j"), neo.get("password", "")),
+        )
+        database = neo.get("database", "neo4j")
         with driver.session(database=database) as session:
             if neo.get("clear_existing", True):
                 session.run("MATCH (n:KBNode) DETACH DELETE n")
@@ -103,8 +101,14 @@ def publish_graph_backend(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
                     """,
                     rows=batch,
                 )
+    except Exception as e:
+        return _publish_error(nodes, edges, evidence, e)
     finally:
-        driver.close()
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:
+                pass
 
     return pd.DataFrame([{
         "exported_at": now_iso(),
@@ -113,4 +117,15 @@ def publish_graph_backend(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
         "evidence_count": int(len(evidence)),
         "status": "ok",
         "details": "",
+    }])
+
+
+def _publish_error(nodes: pd.DataFrame, edges: pd.DataFrame, evidence: pd.DataFrame, details: str) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "exported_at": now_iso(),
+        "node_count": int(len(nodes)),
+        "edge_count": int(len(edges)),
+        "evidence_count": int(len(evidence)),
+        "status": "error",
+        "details": str(details)[:4000],
     }])

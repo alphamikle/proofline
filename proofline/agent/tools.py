@@ -9,7 +9,7 @@ import pandas as pd
 
 from proofline.storage import KB
 from proofline.utils import normalize_name, json_dumps
-from proofline.extractors.embeddings import load_sentence_transformer
+from proofline.extractors.embeddings import embedding_model_id, load_embedder, vector_shard_dir
 
 
 class KBTools:
@@ -62,6 +62,105 @@ class KBTools:
         endpoints = self.kb.query_df("SELECT method, path, source, source_file, confidence FROM api_endpoints WHERE service_id = ? ORDER BY method, path LIMIT 500", [sid]).to_dict("records")
         owners = self.kb.query_df("SELECT * FROM ownership WHERE entity_id = ? OR entity_id = ? LIMIT 20", [f"service:{sid}", f"repo:{sid}"]).to_dict("records")
         return {"service": service[0] if service else {"service_id": sid}, "endpoints": endpoints, "owners": owners}
+
+    def get_change_history(self, service_id: str, query: str = "", limit: int = 50) -> Dict[str, Any]:
+        sid = service_id.replace("service:", "")
+        repo_id = sid
+        si = self.kb.query_df("SELECT repo_id FROM service_identity WHERE service_id = ? LIMIT 1", [sid])
+        if not si.empty and str(si.iloc[0].get("repo_id") or ""):
+            repo_id = str(si.iloc[0].get("repo_id"))
+        terms = [t for t in re.split(r"\W+", query.lower()) if len(t) > 2][:8]
+        where = "repo_id = ?"
+        params: List[Any] = [repo_id]
+        if terms:
+            clauses = []
+            for t in terms:
+                like = f"%{t}%"
+                clauses.append("(lower(subject) LIKE ? OR lower(body) LIKE ? OR lower(detected_jira_keys) LIKE ?)")
+                params.extend([like, like, like])
+            where += " AND (" + " OR ".join(clauses) + ")"
+        commits = self.kb.query_df(
+            f"""
+            SELECT repo_id, commit_sha, author_name, author_email, commit_time,
+                   subject, is_revert, is_hotfix, detected_jira_keys
+            FROM git_commits
+            WHERE {where}
+            ORDER BY commit_time DESC
+            LIMIT {int(limit)}
+            """,
+            params,
+        ).to_dict("records")
+        semantic = self.kb.query_df(
+            """
+            SELECT * FROM git_semantic_changes
+            WHERE repo_id = ?
+            ORDER BY confidence DESC
+            LIMIT ?
+            """,
+            [repo_id, int(limit)],
+        ).to_dict("records")
+        return {
+            "repo_id": repo_id,
+            "commits": commits,
+            "semantic_changes": semantic,
+            "historical_owners": self.get_historical_owners(repo_id, limit=20),
+            "cochange": self.get_cochange_neighbors(repo_id, limit=limit),
+            "reverts_hotfixes": self.get_revert_hotfix_signals(repo_id, limit=limit),
+        }
+
+    def get_historical_owners(self, repo_id: str, limit: int = 20) -> Dict[str, Any]:
+        recent = self.kb.query_df(
+            """
+            SELECT author_email, max(commit_time) AS last_commit_time, count(*) AS commit_count
+            FROM git_commits
+            WHERE repo_id = ? AND author_email <> ''
+            GROUP BY author_email
+            ORDER BY last_commit_time DESC
+            LIMIT ?
+            """,
+            [repo_id, int(limit)],
+        ).to_dict("records")
+        frequent = self.kb.query_df(
+            """
+            SELECT author_email, count(*) AS commit_count, max(commit_time) AS last_commit_time
+            FROM git_commits
+            WHERE repo_id = ? AND author_email <> ''
+            GROUP BY author_email
+            ORDER BY commit_count DESC, last_commit_time DESC
+            LIMIT ?
+            """,
+            [repo_id, int(limit)],
+        ).to_dict("records")
+        return {"repo_id": repo_id, "recent_contributors": recent, "frequent_contributors": frequent}
+
+    def get_cochange_neighbors(self, repo_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        prefix = f"file:{repo_id}:"
+        return self.kb.query_df(
+            """
+            SELECT * FROM git_cochange_edges
+            WHERE from_entity LIKE ? OR to_entity LIKE ?
+            ORDER BY confidence DESC, same_commit_count DESC
+            LIMIT ?
+            """,
+            [prefix + "%", prefix + "%", int(limit)],
+        ).to_dict("records")
+
+    def get_revert_hotfix_signals(self, repo_id: str, limit: int = 50) -> Dict[str, Any]:
+        reverts = self.kb.query_df(
+            "SELECT * FROM git_reverts WHERE repo_id = ? ORDER BY confidence DESC LIMIT ?",
+            [repo_id, int(limit)],
+        ).to_dict("records")
+        hotfixes = self.kb.query_df(
+            """
+            SELECT repo_id, commit_sha, author_email, commit_time, subject, is_revert, is_hotfix
+            FROM git_commits
+            WHERE repo_id = ? AND (is_hotfix OR is_revert)
+            ORDER BY commit_time DESC
+            LIMIT ?
+            """,
+            [repo_id, int(limit)],
+        ).to_dict("records")
+        return {"repo_id": repo_id, "reverts": reverts, "hotfixes_or_rollbacks": hotfixes}
 
     def get_service_dependencies(self, service_id: str, env: str = "prod", window_days: int = 30) -> List[Dict[str, Any]]:
         sid = service_id.replace("service:", "")
@@ -198,6 +297,85 @@ class KBTools:
             con.close()
 
     def search_code_vector(self, query: str, repo_id: str | None = None, limit: int = 25) -> List[Dict[str, Any]]:
+        shard_dir = vector_shard_dir(self.cfg) if self.cfg and self.cfg.get("storage") else None
+        if shard_dir and shard_dir.exists():
+            rows = self.search_code_vector_shards(query, repo_id=repo_id, limit=limit)
+            if rows:
+                return rows
+        return self.search_code_vector_legacy(query, repo_id=repo_id, limit=limit)
+
+    def search_code_vector_shards(self, query: str, repo_id: str | None = None, limit: int = 25) -> List[Dict[str, Any]]:
+        try:
+            import numpy as np
+        except Exception:
+            return []
+        try:
+            emb_cfg = self.cfg.get("indexing", {}).get("embeddings", {})
+            model_id = embedding_model_id(emb_cfg)
+            if self._embedding_model is None:
+                self._embedding_model = load_embedder(emb_cfg)
+            qvec = self._embedding_model.encode(
+                [query],
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).astype("float32")
+            import faiss
+
+            shard_specs = []
+            if repo_id:
+                status = self.kb.query_df(
+                    """
+                    SELECT repo_id, index_path, meta_path
+                    FROM code_embedding_repo_status
+                    WHERE status = 'ok' AND vector_count > 0 AND repo_id = ? AND model_name = ?
+                    LIMIT 1
+                    """,
+                    [repo_id, model_id],
+                )
+                if not status.empty:
+                    row = status.iloc[0].to_dict()
+                    shard_specs.append((repo_id, Path(str(row["index_path"])), Path(str(row["meta_path"]))))
+            else:
+                status = self.kb.query_df(
+                    """
+                    SELECT repo_id, index_path, meta_path
+                    FROM code_embedding_repo_status
+                    WHERE status = 'ok' AND vector_count > 0 AND model_name = ?
+                    ORDER BY repo_id
+                    """,
+                    [model_id],
+                )
+                shard_specs = [
+                    (str(r["repo_id"]), Path(str(r["index_path"])), Path(str(r["meta_path"])))
+                    for r in status.to_dict("records")
+                ]
+
+            rows = []
+            per_shard = max(limit * (3 if repo_id else 1), limit)
+            for shard_repo_id, index_path, meta_path in shard_specs:
+                if not index_path.exists() or not meta_path.exists():
+                    continue
+                index = faiss.read_index(str(index_path))
+                meta_df = pd.read_parquet(meta_path)
+                scores, ids = index.search(np.asarray(qvec), min(per_shard, int(index.ntotal)))
+                for faiss_id, score in zip(ids[0].tolist(), scores[0].tolist()):
+                    if faiss_id < 0:
+                        continue
+                    meta = meta_df[meta_df["faiss_id"] == faiss_id]
+                    if meta.empty:
+                        continue
+                    m = meta.iloc[0].to_dict()
+                    if repo_id and str(m.get("repo_id")) != repo_id:
+                        continue
+                    rows.append({**m, "repo_id": str(m.get("repo_id") or shard_repo_id), "vector_score": float(score), "score": float(score), "retrieval_sources": ["vector"]})
+
+            rows = sorted(rows, key=lambda r: float(r.get("vector_score") or 0.0), reverse=True)[:limit]
+            return self._hydrate_vector_rows(rows)
+        except Exception:
+            return []
+
+    def search_code_vector_legacy(self, query: str, repo_id: str | None = None, limit: int = 25) -> List[Dict[str, Any]]:
         index_path = Path(self.cfg.get("storage", {}).get("vector_index_path", ""))
         meta_path = Path(self.cfg.get("storage", {}).get("vector_meta_path", ""))
         if not index_path.exists() or not meta_path.exists():
@@ -207,10 +385,9 @@ class KBTools:
         except Exception:
             return []
         try:
-            model_name = str(self.cfg.get("indexing", {}).get("embeddings", {}).get("model_name") or "Qwen/Qwen3-Embedding-0.6B")
+            emb_cfg = self.cfg.get("indexing", {}).get("embeddings", {})
             if self._embedding_model is None:
-                device = str(self.cfg.get("indexing", {}).get("embeddings", {}).get("device") or "cpu")
-                self._embedding_model = load_sentence_transformer(model_name, device=device)
+                self._embedding_model = load_embedder(emb_cfg)
             qvec = self._embedding_model.encode(
                 [query],
                 convert_to_numpy=True,
@@ -237,22 +414,25 @@ class KBTools:
                 rows.append({**m, "vector_score": float(score), "score": float(score), "retrieval_sources": ["vector"]})
                 if len(rows) >= limit:
                     break
-            if not rows:
-                return []
-            ids_by_chunk = [r["chunk_id"] for r in rows]
-            placeholders = ",".join(["?"] * len(ids_by_chunk))
-            chunks = self.kb.query_df(f"SELECT * FROM code_chunks WHERE chunk_id IN ({placeholders})", ids_by_chunk)
-            chunk_by_id = {str(r["chunk_id"]): r for r in chunks.to_dict("records")}
-            out = []
-            for r in rows:
-                chunk = chunk_by_id.get(str(r.get("chunk_id")), {})
-                if not chunk:
-                    continue
-                chunk.update({k: v for k, v in r.items() if k not in chunk})
-                out.append(chunk)
-            return out
+            return self._hydrate_vector_rows(rows)
         except Exception:
             return []
+
+    def _hydrate_vector_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not rows:
+            return []
+        ids_by_chunk = [r["chunk_id"] for r in rows]
+        placeholders = ",".join(["?"] * len(ids_by_chunk))
+        chunks = self.kb.query_df(f"SELECT * FROM code_chunks WHERE chunk_id IN ({placeholders})", ids_by_chunk)
+        chunk_by_id = {str(r["chunk_id"]): r for r in chunks.to_dict("records")}
+        out = []
+        for r in rows:
+            chunk = chunk_by_id.get(str(r.get("chunk_id")), {})
+            if not chunk:
+                continue
+            chunk.update({k: v for k, v in r.items() if k not in chunk})
+            out.append(chunk)
+        return out
 
     def merge_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         merged: Dict[str, Dict[str, Any]] = {}

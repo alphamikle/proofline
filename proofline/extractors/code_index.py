@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, Iterator, List
 
 import pandas as pd
 
@@ -92,10 +93,39 @@ def make_chunk(repo_id: str, path: str, rel_path: str, lang: str, kind: str, sym
 
 
 def build_chunks(repo_files: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
+    return pd.DataFrame(iter_file_chunks(repo_files, cfg))
+
+
+def repo_files_fingerprint(repo_files: pd.DataFrame) -> str:
+    if repo_files is None or repo_files.empty:
+        return hashlib.sha1(b"").hexdigest()
+    h = hashlib.sha1()
+    for row in repo_files.sort_values(["repo_id", "rel_path"], kind="stable").itertuples(index=False):
+        rel = str(getattr(row, "rel_path", "") or "")
+        sha1 = str(getattr(row, "sha1", "") or "")
+        size = str(getattr(row, "size_bytes", "") or "")
+        h.update(f"{rel}\0{sha1}\0{size}\n".encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def iter_file_chunks(
+    repo_files: pd.DataFrame,
+    cfg: Dict[str, Any],
+    *,
+    show_progress: bool = False,
+    desc: str | None = None,
+) -> Iterator[Dict[str, Any]]:
     max_bytes = int(float(cfg["repos"].get("max_file_mb", 2)) * 1024 * 1024)
     allowed = set(cfg["repos"].get("include_extensions", []))
-    for _, f in repo_files.iterrows():
+    iterator = repo_files.iterrows()
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+
+            iterator = tqdm(iterator, total=len(repo_files), desc=desc or "Chunking files", unit="file", leave=False)
+        except Exception:
+            pass
+    for _, f in iterator:
         rel = str(f["rel_path"])
         name = Path(rel).name
         ext = Path(rel).suffix
@@ -104,17 +134,91 @@ def build_chunks(repo_files: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
         text = safe_read_text(Path(f["path"]), max_bytes=max_bytes)
         if text is None:
             continue
-        rows.extend(chunk_text(str(f["repo_id"]), str(f["path"]), rel, text))
-    return pd.DataFrame(rows)
+        yield from chunk_text(str(f["repo_id"]), str(f["path"]), rel, text)
+
+
+def file_fingerprint(row: pd.Series | Dict[str, Any]) -> str:
+    get = row.get if isinstance(row, dict) else row.get
+    rel = str(get("rel_path") or "")
+    sha1 = str(get("sha1") or "")
+    size = str(get("size_bytes") or "")
+    return hashlib.sha1(f"{rel}\0{sha1}\0{size}".encode("utf-8", errors="ignore")).hexdigest()
+
+
+def chunks_for_file(file_row: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    max_bytes = int(float(cfg["repos"].get("max_file_mb", 2)) * 1024 * 1024)
+    allowed = set(cfg["repos"].get("include_extensions", []))
+    rel = str(file_row["rel_path"])
+    name = Path(rel).name
+    ext = Path(rel).suffix
+    if allowed and ext not in allowed and name not in allowed:
+        return []
+    text = safe_read_text(Path(str(file_row["path"])), max_bytes=max_bytes)
+    if text is None:
+        return []
+    return chunk_text(str(file_row["repo_id"]), str(file_row["path"]), rel, text)
+
+
+def chunked_rows(rows: Iterable[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, Any]]]:
+    batch: List[Dict[str, Any]] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def build_sqlite_fts(chunks: pd.DataFrame, sqlite_path: str | Path) -> None:
+    reset_sqlite_fts(sqlite_path)
+    insert_sqlite_fts(chunks, sqlite_path)
+
+
+def reset_sqlite_fts(sqlite_path: str | Path) -> None:
     sqlite_path = Path(sqlite_path)
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(sqlite_path))
     cur = con.cursor()
     cur.execute("DROP TABLE IF EXISTS chunks")
     cur.execute("CREATE VIRTUAL TABLE chunks USING fts5(chunk_id, repo_id, rel_path, language, kind, symbol, text)")
+    con.commit()
+    con.close()
+
+
+def ensure_sqlite_fts(sqlite_path: str | Path) -> None:
+    sqlite_path = Path(sqlite_path)
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(sqlite_path))
+    cur = con.cursor()
+    cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(chunk_id, repo_id, rel_path, language, kind, symbol, text)")
+    con.commit()
+    con.close()
+
+
+def delete_sqlite_fts_repo(sqlite_path: str | Path, repo_id: str) -> None:
+    ensure_sqlite_fts(sqlite_path)
+    con = sqlite3.connect(str(sqlite_path))
+    cur = con.cursor()
+    cur.execute("DELETE FROM chunks WHERE repo_id = ?", (repo_id,))
+    con.commit()
+    con.close()
+
+
+def delete_sqlite_fts_file(sqlite_path: str | Path, repo_id: str, rel_path: str) -> None:
+    ensure_sqlite_fts(sqlite_path)
+    con = sqlite3.connect(str(sqlite_path))
+    cur = con.cursor()
+    cur.execute("DELETE FROM chunks WHERE repo_id = ? AND rel_path = ?", (repo_id, rel_path))
+    con.commit()
+    con.close()
+
+
+def insert_sqlite_fts(chunks: pd.DataFrame, sqlite_path: str | Path) -> None:
+    ensure_sqlite_fts(sqlite_path)
+    sqlite_path = Path(sqlite_path)
+    con = sqlite3.connect(str(sqlite_path))
+    cur = con.cursor()
     if not chunks.empty:
         cur.executemany(
             "INSERT INTO chunks(chunk_id, repo_id, rel_path, language, kind, symbol, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
