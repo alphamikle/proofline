@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from proofline.config import ensure_dirs, load_config
+from proofline.progress import progress_bar, progress_iter
 from proofline.utils import now_iso, stable_id
 
 
@@ -77,10 +78,16 @@ class AtlassianClient:
                 time.sleep(self.retry_sleep * (attempt + 1))
                 continue
             r.raise_for_status()
+            total = int(r.headers.get("content-length") or 0) or None
+            bar = progress_bar(total=total, desc=f"Downloading {target.name}", unit="B", unit_scale=True, leave=False)
             with target.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
+                        if bar:
+                            bar.update(len(chunk))
+            if bar:
+                bar.close()
             return {"path": str(target), "size_bytes": target.stat().st_size, "content_type": r.headers.get("content-type", "")}
         raise RuntimeError("unreachable")
 
@@ -101,15 +108,20 @@ def confluence_cql(cfg: Dict[str, Any], content_type: str) -> str:
     return " AND ".join(parts)
 
 
-def paged_results(client: AtlassianClient, path: str, params: Dict[str, Any], limit_key: str = "limit") -> Iterator[Dict[str, Any]]:
+def paged_results(client: AtlassianClient, path: str, params: Dict[str, Any], limit_key: str = "limit", desc: str = "") -> Iterator[Dict[str, Any]]:
     start = int(params.get("start", 0))
     limit = int(params.get(limit_key, 100))
+    bar = progress_bar(desc=desc or path, unit="page", leave=False)
     while True:
         params = dict(params, start=start, **{limit_key: limit})
         data = client.get_json(client.api_url(path), params=params)
+        if bar:
+            bar.update(1)
         yield data
         results = data.get("results") or []
         if not results or len(results) < limit:
+            if bar:
+                bar.close()
             break
         start += len(results)
 
@@ -134,26 +146,30 @@ def mirror_confluence(config_path: str, dry_run: bool = False) -> None:
     max_items = conf.get("max_items")
     manifest: Dict[str, Any] = {"started_at": now_iso(), "items": [], "attachments": []}
     count = 0
-    for content_type in conf.get("content_types", ["page", "blogpost"]):
+    content_types = conf.get("content_types", ["page", "blogpost"])
+    item_bar = progress_bar(total=int(max_items) if max_items else None, desc="Confluence content", unit="item")
+    for content_type in progress_iter(content_types, total=len(content_types), desc="Confluence content types", unit="type"):
         params = {"cql": confluence_cql(conf, content_type), "expand": expand, "limit": page_limit}
-        for page in paged_results(client, "content/search", params):
+        for page in paged_results(client, "content/search", params, desc=f"Confluence {content_type} pages"):
             for item in page.get("results") or []:
                 content_id = str(item.get("id"))
                 write_json(out / "content" / f"{content_id}.json", item)
                 manifest["items"].append({"id": content_id, "type": item.get("type"), "title": item.get("title")})
                 count += 1
+                if item_bar:
+                    item_bar.update(1)
                 if conf.get("include_comments", True):
                     comments = []
-                    for cp in paged_results(client, f"content/{content_id}/child/comment", {"expand": "body.storage,body.view,version,history", "limit": page_limit}):
+                    for cp in paged_results(client, f"content/{content_id}/child/comment", {"expand": "body.storage,body.view,version,history", "limit": page_limit}, desc=f"Confluence comments {content_id}"):
                         comments.extend(cp.get("results") or [])
                     write_json(out / "comments" / f"{content_id}.json", comments)
                 if conf.get("include_attachments", True):
                     attachments = []
-                    for ap in paged_results(client, f"content/{content_id}/child/attachment", {"expand": "version,container,metadata", "limit": page_limit}):
+                    for ap in paged_results(client, f"content/{content_id}/child/attachment", {"expand": "version,container,metadata", "limit": page_limit}, desc=f"Confluence attachments {content_id}"):
                         attachments.extend(ap.get("results") or [])
                     write_json(out / "attachments" / f"{content_id}.json", attachments)
                     if conf.get("download_attachments", True):
-                        for att in attachments:
+                        for att in progress_iter(attachments, total=len(attachments), desc=f"Confluence files {content_id}", unit="file", leave=False):
                             link = ((att.get("_links") or {}).get("download") or "")
                             if not link:
                                 continue
@@ -162,9 +178,13 @@ def mirror_confluence(config_path: str, dry_run: bool = False) -> None:
                             info = client.download(client.resolve_link(link), target)
                             manifest["attachments"].append({"content_id": content_id, "attachment_id": att.get("id"), "title": att.get("title"), **info})
                 if max_items and count >= int(max_items):
+                    if item_bar:
+                        item_bar.close()
                     write_json(out / "manifest.json", {**manifest, "finished_at": now_iso(), "count": count})
                     print(f"Downloaded {count} Confluence content items into {out}")
                     return
+    if item_bar:
+        item_bar.close()
     write_json(out / "manifest.json", {**manifest, "finished_at": now_iso(), "count": count})
     print(f"Downloaded {count} Confluence content items into {out}")
 

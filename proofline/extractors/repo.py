@@ -6,7 +6,7 @@ import re
 import subprocess
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import pandas as pd
 
@@ -149,6 +149,7 @@ def scan_repo(
     *,
     progress_desc: str | None = None,
     progress_position: int = 1,
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     repo_id = repo_id_from_path(repo)
     exclude_dirs = cfg["repos"].get("exclude_dirs", [])
@@ -185,6 +186,8 @@ def scan_repo(
             "sha1": file_sha1(path),
             "indexed_at": now_iso(),
         })
+        if progress_callback is not None:
+            progress_callback(1)
     primary_language = language_counts.most_common(1)[0][0] if language_counts else "unknown"
     names = {Path(f["rel_path"]).name.lower() for f in files}
     rels = [f["rel_path"].lower() for f in files]

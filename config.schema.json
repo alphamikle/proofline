@@ -189,7 +189,32 @@
       "properties": {
         "lexical_fts": { "type": "boolean", "default": true },
         "chunk_write_batch_size": { "$ref": "#/definitions/positiveInteger" },
+        "repo_max_workers": {
+          "$ref": "#/definitions/positiveInteger",
+          "description": "Maximum number of repositories to index concurrently during code_index. indexing.max_workers controls per-repository file chunking."
+        },
         "max_workers": { "$ref": "#/definitions/positiveInteger" },
+        "ast_chunking": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "source": {
+              "type": "string",
+              "enum": ["cgc"],
+              "default": "cgc",
+              "description": "Source for AST-aware symbol boundaries."
+            },
+            "fallback_regex": { "type": "boolean", "default": true },
+            "keep_file_windows": { "type": "boolean", "default": true },
+            "include_node_types": { "$ref": "#/definitions/stringArray" },
+            "max_symbol_lines": { "$ref": "#/definitions/positiveInteger" },
+            "symbol_window_lines": { "$ref": "#/definitions/positiveInteger" },
+            "symbol_window_overlap": { "$ref": "#/definitions/nonNegativeInteger" },
+            "include_context_prefix": { "type": "boolean", "default": true },
+            "dedupe_overlapping_chunks": { "type": "boolean", "default": true }
+          }
+        },
         "embeddings": {
           "type": "object",
           "additionalProperties": false,

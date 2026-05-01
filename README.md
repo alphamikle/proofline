@@ -184,6 +184,11 @@ Build derived indexes and the local graph:
 proofline build
 ```
 
+When `indexing.ast_chunking.enabled` and `code_graph.enabled` are true, `proofline build`
+and `proofline run` build/import CGC code graph symbols before `code_index`, then use
+those symbol boundaries for AST-aware code chunks. If CGC is disabled, unavailable, or has
+no symbols for a file, code indexing falls back to regex symbol chunks and file windows.
+
 Run the full pipeline:
 
 ```bash
@@ -203,6 +208,7 @@ Useful stage aliases:
 ```text
 repos       -> repo_ingest
 history     -> git_history
+code-graph  -> code_graph
 code        -> code_index
 api         -> api_surface
 runtime     -> datadog
@@ -211,6 +217,32 @@ identity    -> entity_resolution
 endpoints   -> endpoint_map
 publish     -> external graph backend projection
 ```
+
+AST-aware chunking is configured under `indexing.ast_chunking`:
+
+```yaml
+indexing:
+  # Number of repositories indexed concurrently by code_index.
+  repo_max_workers: 4
+  # Number of files chunked concurrently inside each repository.
+  max_workers: 4
+  ast_chunking:
+    enabled: true
+    source: cgc
+    fallback_regex: true
+    keep_file_windows: true
+    include_node_types: [Function, Class, Method, Module, Struct, Enum, Interface]
+    max_symbol_lines: 240
+    symbol_window_lines: 160
+    symbol_window_overlap: 30
+    include_context_prefix: true
+    dedupe_overlapping_chunks: true
+```
+
+AST chunks are stored in `code_chunks` with stable kinds such as `ast_function`,
+`ast_method`, `ast_class`, `ast_interface`, `ast_enum`, `ast_module`, `ast_struct`,
+and `ast_large_symbol_window`. Default embedding `include_kinds` includes these
+AST-aware chunks plus `doc_section`, `file_window`, and fallback `symbol` chunks.
 
 ## Ask Questions
 

@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from proofline.config import ensure_dirs, load_config
+from proofline.progress import progress_bar, progress_iter
 from proofline.utils import now_iso
 
 
@@ -76,10 +77,16 @@ class JiraClient:
                 time.sleep(self.retry_sleep * (attempt + 1))
                 continue
             r.raise_for_status()
+            total = int(r.headers.get("content-length") or 0) or None
+            bar = progress_bar(total=total, desc=f"Downloading {target.name}", unit="B", unit_scale=True, leave=False)
             with target.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
+                        if bar:
+                            bar.update(len(chunk))
+            if bar:
+                bar.close()
             return {"path": str(target), "size_bytes": target.stat().st_size, "content_type": r.headers.get("content-type", "")}
         raise RuntimeError("unreachable")
 
@@ -108,15 +115,20 @@ def jira_search(client: JiraClient, cfg: Dict[str, Any]) -> Iterator[Dict[str, A
         start_at += len(issues)
 
 
-def paged_child(client: JiraClient, path: str, item_key: str, page_limit: int = 100) -> List[Dict[str, Any]]:
+def paged_child(client: JiraClient, path: str, item_key: str, page_limit: int = 100, desc: str = "") -> List[Dict[str, Any]]:
     start_at = 0
     rows: List[Dict[str, Any]] = []
+    bar = progress_bar(desc=desc or path, unit="page", leave=False)
     while True:
         data = client.get_json(client.api_url(path), {"startAt": start_at, "maxResults": page_limit})
+        if bar:
+            bar.update(1)
         items = data.get(item_key) or data.get("values") or []
         rows.extend(items)
         total = int(data.get("total") or len(rows))
         if not items or start_at + len(items) >= total:
+            if bar:
+                bar.close()
             return rows
         start_at += len(items)
 
@@ -140,14 +152,15 @@ def mirror_jira(config_path: str, dry_run: bool = False) -> None:
 
     if jira.get("download_metadata", True):
         metadata = {}
-        for name, path in {
+        metadata_endpoints = {
             "fields": "field",
             "statuses": "status",
             "priorities": "priority",
             "resolutions": "resolution",
             "issue_types": "issuetype",
             "projects": "project/search",
-        }.items():
+        }
+        for name, path in progress_iter(metadata_endpoints.items(), total=len(metadata_endpoints), desc="Jira metadata", unit="endpoint"):
             try:
                 metadata[name] = client.get_json(client.api_url(path))
             except Exception as e:
@@ -156,19 +169,26 @@ def mirror_jira(config_path: str, dry_run: bool = False) -> None:
 
     count = 0
     max_issues = jira.get("max_issues")
+    issue_bar = None
     for page in jira_search(client, jira):
+        issues = page.get("issues") or []
+        if issue_bar is None:
+            total = int(page.get("total") or 0) or None
+            if total and max_issues:
+                total = min(total, int(max_issues))
+            issue_bar = progress_bar(total=total, desc="Jira issues", unit="issue")
         for issue in page.get("issues") or []:
             key = str(issue.get("key"))
             write_json(out / "issues" / f"{safe_name(key)}.json", issue)
             manifest["issues"].append({"key": key, "id": issue.get("id"), "summary": ((issue.get("fields") or {}).get("summary") or "")})
             if jira.get("include_comments", True):
-                comments = paged_child(client, f"issue/{key}/comment", "comments", page_limit)
+                comments = paged_child(client, f"issue/{key}/comment", "comments", page_limit, desc=f"Jira comments {key}")
                 write_json(out / "comments" / f"{safe_name(key)}.json", comments)
             if jira.get("include_changelog", True):
-                changelog = paged_child(client, f"issue/{key}/changelog", "values", page_limit)
+                changelog = paged_child(client, f"issue/{key}/changelog", "values", page_limit, desc=f"Jira changelog {key}")
                 write_json(out / "changelog" / f"{safe_name(key)}.json", changelog)
             if jira.get("include_worklogs", True):
-                worklogs = paged_child(client, f"issue/{key}/worklog", "worklogs", page_limit)
+                worklogs = paged_child(client, f"issue/{key}/worklog", "worklogs", page_limit, desc=f"Jira worklogs {key}")
                 write_json(out / "worklogs" / f"{safe_name(key)}.json", worklogs)
             if jira.get("include_remote_links", True):
                 try:
@@ -187,7 +207,8 @@ def mirror_jira(config_path: str, dry_run: bool = False) -> None:
                 except Exception as e:
                     write_json(out / "properties" / f"{safe_name(key)}.json", {"error": str(e)})
             if jira.get("include_attachments", True) and jira.get("download_attachments", True):
-                for att in ((issue.get("fields") or {}).get("attachment") or []):
+                attachments = ((issue.get("fields") or {}).get("attachment") or [])
+                for att in progress_iter(attachments, total=len(attachments), desc=f"Jira attachments {key}", unit="file", leave=False):
                     url = att.get("content")
                     if not url:
                         continue
@@ -196,11 +217,19 @@ def mirror_jira(config_path: str, dry_run: bool = False) -> None:
                     info = client.download(url, target)
                     manifest["attachments"].append({"issue": key, "attachment_id": att.get("id"), "filename": att.get("filename"), **info})
             count += 1
+            if issue_bar:
+                issue_bar.update(1)
             if max_issues and count >= int(max_issues):
+                if issue_bar:
+                    issue_bar.close()
                 write_json(out / "manifest.json", {**manifest, "finished_at": now_iso(), "count": count})
                 print(f"Downloaded {count} Jira issues into {out}")
                 return
+        if not issues and issue_bar:
+            issue_bar.close()
     write_json(out / "manifest.json", {**manifest, "finished_at": now_iso(), "count": count})
+    if issue_bar:
+        issue_bar.close()
     print(f"Downloaded {count} Jira issues into {out}")
 
 

@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import pandas as pd
 import typer
@@ -12,9 +13,10 @@ from proofline.config import DEFAULT_CONFIG, load_config, ensure_dirs
 from proofline.logging_utils import setup_logging, log_step, console
 from proofline.storage import KB
 from proofline.utils import now_iso
-from proofline.extractors.repo import find_git_repos, repo_id_from_path, repo_source_fingerprint, scan_repo
-from proofline.extractors.git_history import build_cochange_edges, extract_repo_git_blame, extract_repo_git_history
+from proofline.extractors.repo import find_git_repos, iter_files, repo_id_from_path, repo_source_fingerprint, scan_repo
+from proofline.extractors.git_history import build_cochange_edges, extract_commits, extract_repo_git_blame, extract_repo_git_history, should_index_blame
 from proofline.extractors.code_index import (
+    ast_chunking_config,
     chunked_rows,
     chunks_for_file,
     delete_sqlite_fts_file,
@@ -38,6 +40,9 @@ from proofline.extractors.code_graph import import_code_graph, run_code_graph_in
 from proofline.pipeline.repo_jobs import mark_repo_stage, max_workers, repo_stage_done
 
 app = typer.Typer(help="Proofline pipeline")
+
+_CODE_INDEX_DB_WRITE_LOCK = Lock()
+_CODE_INDEX_SQLITE_FTS_LOCK = Lock()
 
 
 def stage_record(kb: KB, stage: str, started: str, status: str, details: str = "") -> None:
@@ -105,11 +110,22 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
     except Exception:
         tqdm = None
 
+    global_bar = None
+
+    def update_global_progress(n: int) -> None:
+        if global_bar is not None:
+            global_bar.update(n)
+
     def scan_one(repo_path: Path) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         repo_id = repo_id_from_path(repo_path)
         fingerprint = repo_source_fingerprint(repo_path, cfg)
-        progress_desc = f"Scanning {repo_id}" if workers == 1 else None
-        inv, fs, own, hist = scan_repo(repo_path, cfg, progress_desc=progress_desc)
+        progress_desc = f"REPO scan {repo_id}" if workers == 1 else None
+        inv, fs, own, hist = scan_repo(
+            repo_path,
+            cfg,
+            progress_desc=progress_desc,
+            progress_callback=update_global_progress if global_bar is not None else None,
+        )
         return repo_id, fingerprint, inv, fs, own, hist
 
     pending: list[Path] = []
@@ -124,29 +140,44 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
         mark_repo_stage(kb, "repo_ingest", repo_id, fingerprint, "running")
         pending.append(repo)
 
+    pending_file_counts = {repo: _repo_ingest_file_count(repo, cfg) for repo in pending} if tqdm else {}
+    if tqdm:
+        global_bar = tqdm(total=sum(pending_file_counts.values()), desc="GLOBAL repo ingest", unit="file", position=0)
+
     iterator: Any
-    if workers > 1 and len(pending) > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(scan_one, repo) for repo in pending]
-            iterator = as_completed(futures)
-            if tqdm:
-                iterator = tqdm(iterator, total=len(futures), desc="Scanning repositories", unit="repo", position=0)
-            for future in iterator:
-                repo_id, fingerprint, inv, fs, own, hist = future.result()
+    try:
+        if workers > 1 and len(pending) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(scan_one, repo) for repo in pending]
+                iterator = as_completed(futures)
+                repo_bar = None
+                if tqdm:
+                    repo_bar = tqdm(total=0, desc="REPO scan", unit="file", position=1, leave=False)
+                try:
+                    for future in iterator:
+                        repo_id, fingerprint, inv, fs, own, hist = future.result()
+                        _replace_repo_ingest_rows(kb, repo_id, inv, fs, own, hist)
+                        mark_repo_stage(kb, "repo_ingest", repo_id, fingerprint, "ok", item_count=len(fs))
+                        if repo_bar is not None:
+                            repo_bar.reset(total=len(fs))
+                            repo_bar.set_description(f"REPO scan {repo_id}")
+                            repo_bar.update(len(fs))
+                        scanned += 1
+                        file_count += len(fs)
+                finally:
+                    if repo_bar is not None:
+                        repo_bar.close()
+        else:
+            iterator = pending
+            for repo in iterator:
+                repo_id, fingerprint, inv, fs, own, hist = scan_one(repo)
                 _replace_repo_ingest_rows(kb, repo_id, inv, fs, own, hist)
                 mark_repo_stage(kb, "repo_ingest", repo_id, fingerprint, "ok", item_count=len(fs))
                 scanned += 1
                 file_count += len(fs)
-    else:
-        iterator = pending
-        if tqdm:
-            iterator = tqdm(iterator, total=len(pending), desc="Scanning repositories", unit="repo", position=0)
-        for repo in iterator:
-            repo_id, fingerprint, inv, fs, own, hist = scan_one(repo)
-            _replace_repo_ingest_rows(kb, repo_id, inv, fs, own, hist)
-            mark_repo_stage(kb, "repo_ingest", repo_id, fingerprint, "ok", item_count=len(fs))
-            scanned += 1
-            file_count += len(fs)
+    finally:
+        if global_bar is not None:
+            global_bar.close()
     console.print(f"repos: {len(repos)}, files: {file_count}, scanned={scanned}, skipped={skipped}")
 
 
@@ -175,6 +206,13 @@ def _delete_repo_ingest_rows(kb: KB, repo_id: str) -> None:
     kb.execute("DELETE FROM repo_git_history WHERE repo_id = ?", [repo_id])
 
 
+def _repo_ingest_file_count(repo: Path, cfg: Dict[str, Any]) -> int:
+    try:
+        return sum(1 for _ in iter_files(repo, cfg["repos"].get("exclude_dirs", []), float(cfg["repos"].get("max_file_mb", 2))))
+    except Exception:
+        return 0
+
+
 def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
     gh_cfg = dict(cfg.get("git_history") or {})
     if not gh_cfg.get("enabled", True):
@@ -191,6 +229,12 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
     except Exception:
         tqdm = None
 
+    global_bar = None
+
+    def update_global_progress(n: int) -> None:
+        if global_bar is not None:
+            global_bar.update(n)
+
     def repo_fp(row: dict[str, Any]) -> str:
         return str(row.get("commit_sha") or "") + f":patch={bool(gh_cfg.get('patch_hunks', True))}:rename={bool(gh_cfg.get('rename_detection', True))}"
 
@@ -200,8 +244,16 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
         local_cfg = dict(gh_cfg)
         if row.get("_existing_shas"):
             local_cfg["stop_commit_shas"] = set(row["_existing_shas"])
-        progress_desc = f"History {repo_id}" if workers == 1 else None
-        rows = extract_repo_git_history(Path(str(row.get("repo_path") or "")), repo_id, local_cfg, progress_desc=progress_desc)
+        progress_desc = f"REPO history {repo_id}" if workers == 1 else None
+        commits = row.get("_commits") if isinstance(row.get("_commits"), list) else None
+        rows = extract_repo_git_history(
+            Path(str(row.get("repo_path") or "")),
+            repo_id,
+            local_cfg,
+            progress_desc=progress_desc,
+            progress_callback=update_global_progress if global_bar is not None else None,
+            commits=commits,
+        )
         return repo_id, fingerprint, rows
 
     pending = []
@@ -214,31 +266,56 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
         existing = kb.query_df("SELECT commit_sha FROM git_commits WHERE repo_id = ?", [repo_id])
         row["_existing_shas"] = existing["commit_sha"].fillna("").astype(str).tolist() if not existing.empty else []
         mark_repo_stage(kb, "git_history", repo_id, fingerprint, "running")
+        if tqdm:
+            local_cfg = dict(gh_cfg)
+            if row.get("_existing_shas"):
+                local_cfg["stop_commit_shas"] = set(row["_existing_shas"])
+            row["_commits"] = extract_commits(Path(str(row.get("repo_path") or "")), repo_id, local_cfg)
         pending.append(row)
 
+    if tqdm:
+        global_bar = tqdm(
+            total=sum(len(row.get("_commits") or []) for row in pending),
+            desc="GLOBAL git history",
+            unit="commit",
+            position=0,
+        )
+
     iterator: Any
-    if workers > 1 and len(pending) > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(build_one, row) for row in pending]
-            iterator = as_completed(futures)
-            if tqdm:
-                iterator = tqdm(iterator, total=len(futures), desc="Indexing git history", unit="repo", position=0)
-            for future in iterator:
-                repo_id, fingerprint, rows = future.result()
+    try:
+        if workers > 1 and len(pending) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(build_one, row) for row in pending]
+                iterator = as_completed(futures)
+                repo_bar = None
+                if tqdm:
+                    repo_bar = tqdm(total=0, desc="REPO history", unit="commit", position=1, leave=False)
+                try:
+                    for future in iterator:
+                        repo_id, fingerprint, rows = future.result()
+                        counts = _append_repo_git_history(kb, repo_id, rows)
+                        mark_repo_stage(kb, "git_history", repo_id, fingerprint, "ok", item_count=counts.get("git_commits", 0))
+                        if repo_bar is not None:
+                            commit_count = counts.get("git_commits", 0)
+                            repo_bar.reset(total=commit_count)
+                            repo_bar.set_description(f"REPO history {repo_id}")
+                            repo_bar.update(commit_count)
+                        for key in totals:
+                            totals[key] += counts.get(key, 0)
+                finally:
+                    if repo_bar is not None:
+                        repo_bar.close()
+        else:
+            iterator = pending
+            for row in iterator:
+                repo_id, fingerprint, rows = build_one(row)
                 counts = _append_repo_git_history(kb, repo_id, rows)
                 mark_repo_stage(kb, "git_history", repo_id, fingerprint, "ok", item_count=counts.get("git_commits", 0))
                 for key in totals:
                     totals[key] += counts.get(key, 0)
-    else:
-        iterator = pending
-        if tqdm:
-            iterator = tqdm(iterator, total=len(pending), desc="Indexing git history", unit="repo", position=0)
-        for row in iterator:
-            repo_id, fingerprint, rows = build_one(row)
-            counts = _append_repo_git_history(kb, repo_id, rows)
-            mark_repo_stage(kb, "git_history", repo_id, fingerprint, "ok", item_count=counts.get("git_commits", 0))
-            for key in totals:
-                totals[key] += counts.get(key, 0)
+    finally:
+        if global_bar is not None:
+            global_bar.close()
 
     console.print(
         "git history: "
@@ -271,6 +348,17 @@ def _append_repo_git_history(kb: KB, repo_id: str, rows: dict[str, list[dict[str
     return counts
 
 
+def _git_blame_file_count(repo: Path, gh_cfg: Dict[str, Any]) -> int:
+    try:
+        p = subprocess.run(["git", "ls-files"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=120)
+        if p.returncode != 0:
+            return 0
+        max_files = int(gh_cfg.get("max_blame_files", 500))
+        return len([rel for rel in p.stdout.splitlines() if should_index_blame(rel)][:max_files])
+    except Exception:
+        return 0
+
+
 def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
     gh_cfg = dict(cfg.get("git_history") or {})
     if not gh_cfg.get("enabled", True) or not gh_cfg.get("current_blame", True):
@@ -283,42 +371,74 @@ def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
         from tqdm.auto import tqdm
     except Exception:
         tqdm = None
-    iterator = repos.to_dict("records")
-    if tqdm:
-        iterator = tqdm(iterator, total=len(repos), desc="Indexing git blame", unit="repo", position=0)
-    for row in iterator:
+
+    pending = []
+    for row in repos.to_dict("records"):
         repo_id = str(row.get("repo_id") or "")
         fingerprint = str(row.get("commit_sha") or "") + ":blame"
         if repo_stage_done(kb, "git_blame", repo_id, fingerprint):
             skipped += 1
             continue
         started = now_iso()
+        row["_fingerprint"] = fingerprint
+        row["_started"] = started
         mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "running", started_at=started)
-        try:
-            rows = extract_repo_git_blame(Path(str(row.get("repo_path") or "")), repo_id, gh_cfg, progress_desc=f"Blaming {repo_id}").get("git_blame_current", [])
-            kb.execute("DELETE FROM git_blame_current WHERE repo_id = ?", [repo_id])
-            if rows:
-                kb.append_df("git_blame_current", pd.DataFrame(rows))
-            rows_total += len(rows)
-            mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "ok", started_at=started, item_count=len(rows))
-        except Exception as e:
-            mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "error", started_at=started, details=str(e))
-            raise
+        pending.append(row)
+
+    global_bar = None
+    if tqdm:
+        global_bar = tqdm(
+            total=sum(_git_blame_file_count(Path(str(row.get("repo_path") or "")), gh_cfg) for row in pending),
+            desc="GLOBAL git blame",
+            unit="file",
+            position=0,
+        )
+
+    def update_global_progress(n: int) -> None:
+        if global_bar is not None:
+            global_bar.update(n)
+
+    try:
+        for row in pending:
+            repo_id = str(row.get("repo_id") or "")
+            fingerprint = str(row.get("_fingerprint") or "")
+            started = str(row.get("_started") or now_iso())
+            try:
+                rows = extract_repo_git_blame(
+                    Path(str(row.get("repo_path") or "")),
+                    repo_id,
+                    gh_cfg,
+                    progress_desc=f"REPO blame {repo_id}",
+                    progress_callback=update_global_progress if global_bar is not None else None,
+                ).get("git_blame_current", [])
+                kb.execute("DELETE FROM git_blame_current WHERE repo_id = ?", [repo_id])
+                if rows:
+                    kb.append_df("git_blame_current", pd.DataFrame(rows))
+                rows_total += len(rows)
+                mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "ok", started_at=started, item_count=len(rows))
+            except Exception as e:
+                mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "error", started_at=started, details=str(e))
+                raise
+    finally:
+        if global_bar is not None:
+            global_bar.close()
     console.print(f"git blame: rows={rows_total}, skipped={skipped}")
 
 
-def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
+def _stage_code_index_serial(kb: KB, cfg: Dict[str, Any]) -> None:
     repos = kb.query_df("SELECT repo_id FROM repo_inventory ORDER BY repo_id")
     if repos.empty:
         console.print("chunks: no repositories")
         return
 
-    use_fts = bool(cfg.get("indexing", {}).get("lexical_fts", True))
+    indexing_cfg = cfg.get("indexing", {})
+    use_fts = bool(indexing_cfg.get("lexical_fts", True))
     sqlite_fts_path = cfg["storage"]["sqlite_fts_path"]
     if use_fts:
         ensure_sqlite_fts(sqlite_fts_path)
-    write_batch_size = max(1, int(cfg.get("indexing", {}).get("chunk_write_batch_size", 5000)))
-    workers = max_workers(cfg.get("indexing", {}), 1)
+    write_batch_size = max(1, int(indexing_cfg.get("chunk_write_batch_size", 5000)))
+    file_workers = max_workers(indexing_cfg, 1)
+    repo_workers = _code_index_repo_workers(indexing_cfg)
 
     try:
         from tqdm.auto import tqdm
@@ -328,120 +448,180 @@ def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
     total_chunks = 0
     skipped = 0
     iterator = repos["repo_id"].fillna("").astype(str).tolist()
+    global_bar = None
+    repo_file_counts: dict[str, int] = {}
     if tqdm:
-        iterator = tqdm(iterator, total=len(repos), desc="Indexing repositories", unit="repo", position=0)
+        for repo_id in iterator:
+            if repo_id:
+                repo_file_counts[repo_id] = int(kb.query_df("SELECT COUNT(*) AS n FROM repo_files WHERE repo_id = ?", [repo_id]).iloc[0]["n"])
+        global_bar = tqdm(total=sum(repo_file_counts.values()), desc="GLOBAL code index", unit="file", position=0)
 
-    for repo_id in iterator:
-        if not repo_id:
-            continue
-        repo_files = kb.query_df("SELECT * FROM repo_files WHERE repo_id = ? ORDER BY rel_path", [repo_id])
-        fingerprint = repo_files_fingerprint(repo_files)
-        existing = kb.query_df(
+    try:
+        for repo_id in iterator:
+            if not repo_id:
+                continue
+            repo_files = kb.query_df("SELECT * FROM repo_files WHERE repo_id = ? ORDER BY rel_path", [repo_id])
+            graph_symbols = _load_code_index_graph_symbols(kb, cfg, repo_id)
+            graph_by_path = _graph_symbols_by_path(graph_symbols)
+            fingerprint = repo_files_fingerprint(repo_files, cfg, graph_symbols)
+            existing = kb.query_df(
+                """
+                SELECT status, source_fingerprint, chunk_count
+                FROM code_index_repo_status
+                WHERE repo_id = ?
+                ORDER BY finished_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                [repo_id],
+            )
+            if (
+                not existing.empty
+                and str(existing.iloc[0].get("status") or "") == "ok"
+                and str(existing.iloc[0].get("source_fingerprint") or "") == fingerprint
+            ):
+                expected_chunks = int(existing.iloc[0].get("chunk_count") or 0)
+                actual_chunks = int(kb.query_df("SELECT COUNT(*) AS n FROM code_chunks WHERE repo_id = ?", [repo_id]).iloc[0]["n"])
+                fts_ready = (not use_fts) or Path(sqlite_fts_path).exists()
+                if actual_chunks == expected_chunks and fts_ready:
+                    skipped += 1
+                    total_chunks += expected_chunks
+                    mark_repo_stage(kb, "code_index", repo_id, fingerprint, "ok", item_count=expected_chunks, details="cached")
+                    if global_bar is not None:
+                        global_bar.update(repo_file_counts.get(repo_id, len(repo_files)))
+                    continue
+
+            started = now_iso()
+            mark_repo_stage(kb, "code_index", repo_id, fingerprint, "running", started_at=started, item_count=0)
+            kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
+            kb.append_df("code_index_repo_status", pd.DataFrame([{
+                "repo_id": repo_id,
+                "source_fingerprint": fingerprint,
+                "status": "running",
+                "file_count": len(repo_files),
+                "chunk_count": 0,
+                "started_at": started,
+                "finished_at": "",
+                "details": "",
+            }]))
+            chunk_count = 0
+            try:
+                current_paths = set(repo_files["rel_path"].fillna("").astype(str).tolist()) if not repo_files.empty else set()
+                old_paths = kb.query_df("SELECT rel_path FROM code_index_file_status WHERE repo_id = ?", [repo_id])
+                for rel_path in old_paths["rel_path"].fillna("").astype(str).tolist() if not old_paths.empty else []:
+                    if rel_path not in current_paths:
+                        kb.execute("DELETE FROM code_chunks WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
+                        kb.execute("DELETE FROM code_index_file_status WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
+                        if use_fts:
+                            delete_sqlite_fts_file(sqlite_fts_path, repo_id, rel_path)
+
+                changed_files: list[dict[str, Any]] = []
+                existing_status = kb.query_df("SELECT rel_path, file_fingerprint, chunk_count FROM code_index_file_status WHERE repo_id = ?", [repo_id])
+                status_by_path = {str(r["rel_path"]): r for r in existing_status.to_dict("records")} if not existing_status.empty else {}
+                for row in repo_files.to_dict("records"):
+                    rel_path = str(row.get("rel_path") or "")
+                    fp = file_fingerprint(row, cfg, graph_by_path.get(rel_path, []))
+                    status = status_by_path.get(rel_path)
+                    if status and str(status.get("file_fingerprint") or "") == fp:
+                        chunk_count += int(status.get("chunk_count") or 0)
+                        if global_bar is not None:
+                            global_bar.update(1)
+                        continue
+                    changed_files.append(row)
+
+                file_iterator: Any
+                if file_workers > 1 and len(changed_files) > 1:
+                    with ThreadPoolExecutor(max_workers=file_workers) as pool:
+                        future_rows = {
+                            pool.submit(chunks_for_file, row, cfg, graph_by_path.get(str(row.get("rel_path") or ""), [])): row
+                            for row in changed_files
+                        }
+                        file_iterator = as_completed(future_rows)
+                        if tqdm:
+                            file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                        for future in file_iterator:
+                            row = future_rows[future]
+                            chunks = future.result()
+                            chunk_count += _replace_file_chunks(kb, row, chunks, sqlite_fts_path, use_fts, cfg, graph_by_path.get(str(row.get("rel_path") or ""), []))
+                            if global_bar is not None:
+                                global_bar.update(1)
+                else:
+                    file_iterator = changed_files
+                    if tqdm:
+                        file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                    for row in file_iterator:
+                        rel_path = str(row.get("rel_path") or "")
+                        chunks = chunks_for_file(row, cfg, graph_by_path.get(rel_path, []))
+                        chunk_count += _replace_file_chunks(kb, row, chunks, sqlite_fts_path, use_fts, cfg, graph_by_path.get(rel_path, []))
+                        if global_bar is not None:
+                            global_bar.update(1)
+
+                kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
+                kb.append_df("code_index_repo_status", pd.DataFrame([{
+                    "repo_id": repo_id,
+                    "source_fingerprint": fingerprint,
+                    "status": "ok",
+                    "file_count": len(repo_files),
+                    "chunk_count": chunk_count,
+                    "started_at": started,
+                    "finished_at": now_iso(),
+                    "details": "",
+                }]))
+                mark_repo_stage(kb, "code_index", repo_id, fingerprint, "ok", started_at=started, item_count=chunk_count)
+                total_chunks += chunk_count
+            except Exception as e:
+                kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
+                kb.append_df("code_index_repo_status", pd.DataFrame([{
+                    "repo_id": repo_id,
+                    "source_fingerprint": fingerprint,
+                    "status": "error",
+                    "file_count": len(repo_files),
+                    "chunk_count": chunk_count,
+                    "started_at": started,
+                    "finished_at": now_iso(),
+                    "details": str(e),
+                }]))
+                mark_repo_stage(kb, "code_index", repo_id, fingerprint, "error", started_at=started, item_count=chunk_count, details=str(e))
+                raise
+    finally:
+        if global_bar is not None:
+            global_bar.close()
+    console.print(f"chunks: {total_chunks}, repos={len(repos)}, skipped={skipped}")
+
+
+def _load_code_index_graph_symbols(kb: KB, cfg: Dict[str, Any], repo_id: str) -> pd.DataFrame:
+    ast_cfg = ast_chunking_config(cfg)
+    if not ast_cfg.get("enabled", True):
+        return pd.DataFrame()
+    if str(ast_cfg.get("source") or "cgc").lower() != "cgc":
+        return pd.DataFrame()
+    if not cfg.get("code_graph", {}).get("enabled", False):
+        return pd.DataFrame()
+    try:
+        return kb.query_df(
             """
-            SELECT status, source_fingerprint, chunk_count
-            FROM code_index_repo_status
+            SELECT *
+            FROM code_graph_symbols
             WHERE repo_id = ?
-            ORDER BY finished_at DESC NULLS LAST
-            LIMIT 1
+              AND rel_path IS NOT NULL
+              AND rel_path <> ''
+            ORDER BY rel_path, line_start, line_end
             """,
             [repo_id],
         )
-        if (
-            not existing.empty
-            and str(existing.iloc[0].get("status") or "") == "ok"
-            and str(existing.iloc[0].get("source_fingerprint") or "") == fingerprint
-        ):
-            expected_chunks = int(existing.iloc[0].get("chunk_count") or 0)
-            actual_chunks = int(kb.query_df("SELECT COUNT(*) AS n FROM code_chunks WHERE repo_id = ?", [repo_id]).iloc[0]["n"])
-            fts_ready = (not use_fts) or Path(sqlite_fts_path).exists()
-            if actual_chunks == expected_chunks and fts_ready:
-                skipped += 1
-                total_chunks += expected_chunks
-                mark_repo_stage(kb, "code_index", repo_id, fingerprint, "ok", item_count=expected_chunks, details="cached")
-                continue
+    except Exception:
+        return pd.DataFrame()
 
-        started = now_iso()
-        mark_repo_stage(kb, "code_index", repo_id, fingerprint, "running", started_at=started, item_count=0)
-        kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
-        kb.append_df("code_index_repo_status", pd.DataFrame([{
-            "repo_id": repo_id,
-            "source_fingerprint": fingerprint,
-            "status": "running",
-            "file_count": len(repo_files),
-            "chunk_count": 0,
-            "started_at": started,
-            "finished_at": "",
-            "details": "",
-        }]))
-        chunk_count = 0
-        try:
-            current_paths = set(repo_files["rel_path"].fillna("").astype(str).tolist()) if not repo_files.empty else set()
-            old_paths = kb.query_df("SELECT rel_path FROM code_index_file_status WHERE repo_id = ?", [repo_id])
-            for rel_path in old_paths["rel_path"].fillna("").astype(str).tolist() if not old_paths.empty else []:
-                if rel_path not in current_paths:
-                    kb.execute("DELETE FROM code_chunks WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
-                    kb.execute("DELETE FROM code_index_file_status WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
-                    if use_fts:
-                        delete_sqlite_fts_file(sqlite_fts_path, repo_id, rel_path)
 
-            changed_files: list[dict[str, Any]] = []
-            existing_status = kb.query_df("SELECT rel_path, file_fingerprint, chunk_count FROM code_index_file_status WHERE repo_id = ?", [repo_id])
-            status_by_path = {str(r["rel_path"]): r for r in existing_status.to_dict("records")} if not existing_status.empty else {}
-            for row in repo_files.to_dict("records"):
-                rel_path = str(row.get("rel_path") or "")
-                fp = file_fingerprint(row)
-                status = status_by_path.get(rel_path)
-                if status and str(status.get("file_fingerprint") or "") == fp:
-                    chunk_count += int(status.get("chunk_count") or 0)
-                    continue
-                changed_files.append(row)
-
-            file_iterator: Any
-            if workers > 1 and len(changed_files) > 1:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [pool.submit(chunks_for_file, row, cfg) for row in changed_files]
-                    file_iterator = zip(changed_files, futures)
-                    if tqdm:
-                        file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"Chunking {repo_id}", unit="file", position=1, leave=False)
-                    for row, future in file_iterator:
-                        chunks = future.result()
-                        chunk_count += _replace_file_chunks(kb, row, chunks, sqlite_fts_path, use_fts)
-            else:
-                file_iterator = changed_files
-                if tqdm:
-                    file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"Chunking {repo_id}", unit="file", position=1, leave=False)
-                for row in file_iterator:
-                    chunks = chunks_for_file(row, cfg)
-                    chunk_count += _replace_file_chunks(kb, row, chunks, sqlite_fts_path, use_fts)
-
-            kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
-            kb.append_df("code_index_repo_status", pd.DataFrame([{
-                "repo_id": repo_id,
-                "source_fingerprint": fingerprint,
-                "status": "ok",
-                "file_count": len(repo_files),
-                "chunk_count": chunk_count,
-                "started_at": started,
-                "finished_at": now_iso(),
-                "details": "",
-            }]))
-            mark_repo_stage(kb, "code_index", repo_id, fingerprint, "ok", started_at=started, item_count=chunk_count)
-            total_chunks += chunk_count
-        except Exception as e:
-            kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
-            kb.append_df("code_index_repo_status", pd.DataFrame([{
-                "repo_id": repo_id,
-                "source_fingerprint": fingerprint,
-                "status": "error",
-                "file_count": len(repo_files),
-                "chunk_count": chunk_count,
-                "started_at": started,
-                "finished_at": now_iso(),
-                "details": str(e),
-            }]))
-            mark_repo_stage(kb, "code_index", repo_id, fingerprint, "error", started_at=started, item_count=chunk_count, details=str(e))
-            raise
-    console.print(f"chunks: {total_chunks}, repos={len(repos)}, skipped={skipped}")
+def _graph_symbols_by_path(graph_symbols: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    if graph_symbols is None or graph_symbols.empty:
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in graph_symbols.to_dict("records"):
+        rel_path = str(row.get("rel_path") or "")
+        if not rel_path:
+            continue
+        grouped.setdefault(rel_path, []).append(row)
+    return grouped
 
 
 def _replace_file_chunks(
@@ -450,30 +630,331 @@ def _replace_file_chunks(
     chunks: list[dict[str, Any]],
     sqlite_fts_path: str,
     use_fts: bool,
+    cfg: Dict[str, Any] | None = None,
+    graph_symbols: list[dict[str, Any]] | None = None,
+    *,
+    write_batch_size: int = 5000,
+    db_write_lock: Lock | None = None,
+    sqlite_fts_lock: Lock | None = None,
 ) -> int:
+    def write(fn: Callable[[], Any]) -> Any:
+        if db_write_lock is None:
+            return fn()
+        with db_write_lock:
+            return fn()
+
     repo_id = str(row.get("repo_id") or "")
     rel_path = str(row.get("rel_path") or "")
-    kb.execute("DELETE FROM code_chunks WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
-    kb.execute("DELETE FROM code_index_file_status WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
+    write(lambda: _delete_file_index_rows(kb, repo_id, rel_path))
     if use_fts:
-        delete_sqlite_fts_file(sqlite_fts_path, repo_id, rel_path)
+        _delete_sqlite_fts_file_locked(sqlite_fts_path, repo_id, rel_path, sqlite_fts_lock)
     if chunks:
         df = pd.DataFrame(chunks)
-        for batch in chunked_rows(df.to_dict("records"), 5000):
+        for batch in chunked_rows(df.to_dict("records"), write_batch_size):
             batch_df = pd.DataFrame(batch)
-            kb.append_df("code_chunks", batch_df)
+            write(lambda batch_df=batch_df: kb.append_df("code_chunks", batch_df))
             if use_fts:
-                insert_sqlite_fts(batch_df, sqlite_fts_path)
-    kb.append_df("code_index_file_status", pd.DataFrame([{
+                _insert_sqlite_fts_locked(batch_df, sqlite_fts_path, sqlite_fts_lock)
+    status_df = pd.DataFrame([{
         "repo_id": repo_id,
         "rel_path": rel_path,
-        "file_fingerprint": file_fingerprint(row),
+        "file_fingerprint": file_fingerprint(row, cfg, graph_symbols),
         "status": "ok",
         "chunk_count": len(chunks),
         "indexed_at": now_iso(),
         "details": "",
-    }]))
+    }])
+    write(lambda: kb.append_df("code_index_file_status", status_df))
     return len(chunks)
+
+
+def _code_index_repo_workers(indexing_cfg: dict[str, Any]) -> int:
+    value = indexing_cfg.get("repo_max_workers", indexing_cfg.get("repo_workers", 1))
+    try:
+        return max(1, int(value or 1))
+    except Exception:
+        return 1
+
+
+def _delete_file_index_rows(kb: KB, repo_id: str, rel_path: str) -> None:
+    kb.execute("DELETE FROM code_chunks WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
+    kb.execute("DELETE FROM code_index_file_status WHERE repo_id = ? AND rel_path = ?", [repo_id, rel_path])
+
+
+def _delete_sqlite_fts_file_locked(sqlite_fts_path: str, repo_id: str, rel_path: str, lock: Lock | None = None) -> None:
+    if lock is None:
+        delete_sqlite_fts_file(sqlite_fts_path, repo_id, rel_path)
+        return
+    with lock:
+        delete_sqlite_fts_file(sqlite_fts_path, repo_id, rel_path)
+
+
+def _insert_sqlite_fts_locked(chunks: pd.DataFrame, sqlite_fts_path: str, lock: Lock | None = None) -> None:
+    if lock is None:
+        insert_sqlite_fts(chunks, sqlite_fts_path)
+        return
+    with lock:
+        insert_sqlite_fts(chunks, sqlite_fts_path)
+
+
+def _replace_code_index_repo_status(
+    kb: KB,
+    repo_id: str,
+    fingerprint: str,
+    status: str,
+    file_count: int,
+    chunk_count: int,
+    started_at: str,
+    *,
+    details: str = "",
+) -> None:
+    kb.execute("DELETE FROM code_index_repo_status WHERE repo_id = ?", [repo_id])
+    kb.append_df("code_index_repo_status", pd.DataFrame([{
+        "repo_id": repo_id,
+        "source_fingerprint": fingerprint,
+        "status": status,
+        "file_count": file_count,
+        "chunk_count": chunk_count,
+        "started_at": started_at,
+        "finished_at": "" if status == "running" else now_iso(),
+        "details": details,
+    }]))
+
+
+def _index_code_repo(
+    kb: KB,
+    cfg: Dict[str, Any],
+    repo_id: str,
+    sqlite_fts_path: str,
+    use_fts: bool,
+    file_workers: int,
+    write_batch_size: int,
+    *,
+    add_progress_total: Callable[[int], None] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    show_file_progress: bool = False,
+    db_write_lock: Lock | None = None,
+    sqlite_fts_lock: Lock | None = None,
+) -> dict[str, Any]:
+    def write(fn: Callable[[], Any]) -> Any:
+        if db_write_lock is None:
+            return fn()
+        with db_write_lock:
+            return fn()
+
+    repo_files = kb.query_df("SELECT * FROM repo_files WHERE repo_id = ? ORDER BY rel_path", [repo_id])
+    graph_symbols = _load_code_index_graph_symbols(kb, cfg, repo_id)
+    graph_by_path = _graph_symbols_by_path(graph_symbols)
+    fingerprint = repo_files_fingerprint(repo_files, cfg, graph_symbols)
+    existing = kb.query_df(
+        """
+        SELECT status, source_fingerprint, chunk_count
+        FROM code_index_repo_status
+        WHERE repo_id = ?
+        ORDER BY finished_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        [repo_id],
+    )
+    if (
+        not existing.empty
+        and str(existing.iloc[0].get("status") or "") == "ok"
+        and str(existing.iloc[0].get("source_fingerprint") or "") == fingerprint
+    ):
+        expected_chunks = int(existing.iloc[0].get("chunk_count") or 0)
+        actual_chunks = int(kb.query_df("SELECT COUNT(*) AS n FROM code_chunks WHERE repo_id = ?", [repo_id]).iloc[0]["n"])
+        fts_ready = (not use_fts) or Path(sqlite_fts_path).exists()
+        if actual_chunks == expected_chunks and fts_ready:
+            write(lambda: mark_repo_stage(kb, "code_index", repo_id, fingerprint, "ok", item_count=expected_chunks, details="cached"))
+            return {"repo_id": repo_id, "chunk_count": expected_chunks, "skipped": True}
+
+    started = now_iso()
+    chunk_count = 0
+    write(lambda: mark_repo_stage(kb, "code_index", repo_id, fingerprint, "running", started_at=started, item_count=0))
+    write(lambda: _replace_code_index_repo_status(kb, repo_id, fingerprint, "running", len(repo_files), 0, started))
+    try:
+        current_paths = set(repo_files["rel_path"].fillna("").astype(str).tolist()) if not repo_files.empty else set()
+        old_paths = kb.query_df("SELECT rel_path FROM code_index_file_status WHERE repo_id = ?", [repo_id])
+        for rel_path in old_paths["rel_path"].fillna("").astype(str).tolist() if not old_paths.empty else []:
+            if rel_path not in current_paths:
+                write(lambda rel_path=rel_path: _delete_file_index_rows(kb, repo_id, rel_path))
+                if use_fts:
+                    _delete_sqlite_fts_file_locked(sqlite_fts_path, repo_id, rel_path, sqlite_fts_lock)
+
+        changed_files: list[dict[str, Any]] = []
+        existing_status = kb.query_df("SELECT rel_path, file_fingerprint, chunk_count FROM code_index_file_status WHERE repo_id = ?", [repo_id])
+        status_by_path = {str(r["rel_path"]): r for r in existing_status.to_dict("records")} if not existing_status.empty else {}
+        for row in repo_files.to_dict("records"):
+            rel_path = str(row.get("rel_path") or "")
+            fp = file_fingerprint(row, cfg, graph_by_path.get(rel_path, []))
+            status = status_by_path.get(rel_path)
+            if status and str(status.get("file_fingerprint") or "") == fp:
+                chunk_count += int(status.get("chunk_count") or 0)
+                continue
+            changed_files.append(row)
+
+        if add_progress_total is not None:
+            add_progress_total(len(changed_files))
+
+        file_iterator: Any
+        if file_workers > 1 and len(changed_files) > 1:
+            with ThreadPoolExecutor(max_workers=file_workers) as pool:
+                futures = {
+                    pool.submit(chunks_for_file, row, cfg, graph_by_path.get(str(row.get("rel_path") or ""), [])): row
+                    for row in changed_files
+                }
+                file_iterator = as_completed(futures)
+                if show_file_progress:
+                    try:
+                        from tqdm.auto import tqdm
+
+                        file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                    except Exception:
+                        pass
+                for future in file_iterator:
+                    row = futures[future]
+                    rel_path = str(row.get("rel_path") or "")
+                    chunks = future.result()
+                    chunk_count += _replace_file_chunks(
+                        kb,
+                        row,
+                        chunks,
+                        sqlite_fts_path,
+                        use_fts,
+                        cfg,
+                        graph_by_path.get(rel_path, []),
+                        write_batch_size=write_batch_size,
+                        db_write_lock=db_write_lock,
+                        sqlite_fts_lock=sqlite_fts_lock,
+                    )
+                    if progress_callback is not None:
+                        progress_callback(1)
+        else:
+            file_iterator = changed_files
+            if show_file_progress:
+                try:
+                    from tqdm.auto import tqdm
+
+                    file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                except Exception:
+                    pass
+            for row in file_iterator:
+                rel_path = str(row.get("rel_path") or "")
+                chunks = chunks_for_file(row, cfg, graph_by_path.get(rel_path, []))
+                chunk_count += _replace_file_chunks(
+                    kb,
+                    row,
+                    chunks,
+                    sqlite_fts_path,
+                    use_fts,
+                    cfg,
+                    graph_by_path.get(rel_path, []),
+                    write_batch_size=write_batch_size,
+                    db_write_lock=db_write_lock,
+                    sqlite_fts_lock=sqlite_fts_lock,
+                )
+                if progress_callback is not None:
+                    progress_callback(1)
+
+        write(lambda: _replace_code_index_repo_status(kb, repo_id, fingerprint, "ok", len(repo_files), chunk_count, started))
+        write(lambda: mark_repo_stage(kb, "code_index", repo_id, fingerprint, "ok", started_at=started, item_count=chunk_count))
+        return {"repo_id": repo_id, "chunk_count": chunk_count, "skipped": False}
+    except Exception as e:
+        write(lambda: _replace_code_index_repo_status(kb, repo_id, fingerprint, "error", len(repo_files), chunk_count, started, details=str(e)))
+        write(lambda: mark_repo_stage(kb, "code_index", repo_id, fingerprint, "error", started_at=started, item_count=chunk_count, details=str(e)))
+        raise
+
+
+def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
+    repos = kb.query_df("SELECT repo_id FROM repo_inventory ORDER BY repo_id")
+    if repos.empty:
+        console.print("chunks: no repositories")
+        return
+
+    indexing_cfg = cfg.get("indexing", {})
+    use_fts = bool(indexing_cfg.get("lexical_fts", True))
+    sqlite_fts_path = cfg["storage"]["sqlite_fts_path"]
+    if use_fts:
+        ensure_sqlite_fts(sqlite_fts_path)
+    write_batch_size = max(1, int(indexing_cfg.get("chunk_write_batch_size", 5000)))
+    file_workers = max_workers(indexing_cfg, 1)
+    repo_workers = _code_index_repo_workers(indexing_cfg)
+    repo_ids = [repo_id for repo_id in repos["repo_id"].fillna("").astype(str).tolist() if repo_id]
+
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
+
+    total_chunks = 0
+    skipped = 0
+    progress_lock = Lock()
+    global_bar = tqdm(total=0, desc="GLOBAL code index", unit="file", position=0) if tqdm else None
+
+    def add_global_total(n: int) -> None:
+        if global_bar is None or n <= 0:
+            return
+        with progress_lock:
+            global_bar.total = int(global_bar.total or 0) + n
+            global_bar.refresh()
+
+    def update_global_progress(n: int) -> None:
+        if global_bar is None or n <= 0:
+            return
+        with progress_lock:
+            global_bar.update(n)
+
+    try:
+        if repo_workers > 1 and len(repo_ids) > 1:
+            def index_one(repo_id: str) -> dict[str, Any]:
+                repo_kb = KB(cfg["storage"]["duckdb_path"])
+                try:
+                    return _index_code_repo(
+                        repo_kb,
+                        cfg,
+                        repo_id,
+                        sqlite_fts_path,
+                        use_fts,
+                        file_workers,
+                        write_batch_size,
+                        add_progress_total=add_global_total,
+                        progress_callback=update_global_progress,
+                        db_write_lock=_CODE_INDEX_DB_WRITE_LOCK,
+                        sqlite_fts_lock=_CODE_INDEX_SQLITE_FTS_LOCK,
+                    )
+                finally:
+                    repo_kb.close()
+
+            with ThreadPoolExecutor(max_workers=repo_workers) as pool:
+                futures = [pool.submit(index_one, repo_id) for repo_id in repo_ids]
+                repo_iterator: Any = as_completed(futures)
+                if tqdm:
+                    repo_iterator = tqdm(repo_iterator, total=len(futures), desc="GLOBAL code repos", unit="repo", position=1, leave=False)
+                for future in repo_iterator:
+                    result = future.result()
+                    total_chunks += int(result.get("chunk_count") or 0)
+                    skipped += int(bool(result.get("skipped")))
+        else:
+            for repo_id in repo_ids:
+                result = _index_code_repo(
+                    kb,
+                    cfg,
+                    repo_id,
+                    sqlite_fts_path,
+                    use_fts,
+                    file_workers,
+                    write_batch_size,
+                    add_progress_total=add_global_total,
+                    progress_callback=update_global_progress,
+                    show_file_progress=True,
+                    sqlite_fts_lock=_CODE_INDEX_SQLITE_FTS_LOCK,
+                )
+                total_chunks += int(result.get("chunk_count") or 0)
+                skipped += int(bool(result.get("skipped")))
+    finally:
+        if global_bar is not None:
+            global_bar.close()
+    console.print(f"chunks: {total_chunks}, repos={len(repo_ids)}, skipped={skipped}, repo_workers={repo_workers}, file_workers={file_workers}")
 
 
 def stage_embeddings(kb: KB, cfg: Dict[str, Any]) -> None:
@@ -495,12 +976,28 @@ def stage_api_surface(kb: KB, cfg: Dict[str, Any]) -> None:
 
 
 def stage_code_graph(kb: KB, cfg: Dict[str, Any]) -> None:
-    if cfg.get("code_graph", {}).get("clear_existing", True):
+    cg_cfg = cfg.get("code_graph", {})
+    if not cg_cfg.get("enabled", False):
+        console.print("code graph: disabled")
+        return
+    if cg_cfg.get("clear_existing", True):
         kb.execute("DELETE FROM code_graph_runs")
         kb.execute("DELETE FROM code_graph_symbols")
         kb.execute("DELETE FROM code_graph_edges")
-    runs = run_code_graph_index(kb, cfg)
-    symbols, edges = import_code_graph(kb, cfg)
+    try:
+        runs = run_code_graph_index(kb, cfg)
+    except Exception as e:
+        console.print(f"[yellow]code graph index failed; continuing without graph symbols: {e}[/yellow]")
+        runs = pd.DataFrame()
+    statuses = {str(s) for s in runs["status"].fillna("").tolist()} if not runs.empty and "status" in runs.columns else set()
+    try:
+        if runs.empty or statuses.isdisjoint({"ok", "cached"}):
+            symbols, edges = pd.DataFrame(), pd.DataFrame()
+        else:
+            symbols, edges = import_code_graph(kb, cfg)
+    except Exception as e:
+        console.print(f"[yellow]code graph import failed; continuing without graph symbols: {e}[/yellow]")
+        symbols, edges = pd.DataFrame(), pd.DataFrame()
     kb.replace_df("code_graph_symbols", symbols)
     kb.replace_df("code_graph_edges", edges)
     counts = runs["status"].value_counts().to_dict() if not runs.empty else {}
@@ -650,7 +1147,7 @@ STAGES: Dict[str, Callable[[KB, Dict[str, Any]], None]] = {
 }
 
 FULL_ORDER = [
-    "repo_ingest", "git_history", "git_blame", "code_index", "embeddings", "api_surface", "code_graph", "static_edges", "datadog", "bigquery",
+    "repo_ingest", "git_history", "git_blame", "code_graph", "code_index", "embeddings", "api_surface", "static_edges", "datadog", "bigquery",
     "entity_resolution", "graph", "endpoint_map", "capabilities", "publish", "smoke",
 ]
 

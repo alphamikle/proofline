@@ -15,6 +15,18 @@ import requests
 
 from proofline.utils import now_iso
 
+AST_EMBEDDING_KINDS = {
+    "ast_symbol",
+    "ast_function",
+    "ast_method",
+    "ast_class",
+    "ast_interface",
+    "ast_enum",
+    "ast_module",
+    "ast_struct",
+    "ast_large_symbol_window",
+}
+
 
 def text_sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
@@ -39,6 +51,9 @@ def eligible_chunks(chunks: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame()
     df = chunks.copy()
     include_kinds = set(emb.get("include_kinds") or [])
+    ast_cfg = cfg.get("indexing", {}).get("ast_chunking", {}) or {}
+    if ast_cfg.get("enabled", True):
+        include_kinds.update(AST_EMBEDDING_KINDS)
     exclude_languages = set(emb.get("exclude_languages") or [])
     min_chars = int(emb.get("min_text_chars", 80))
     max_chunks = emb.get("max_chunks")
@@ -410,6 +425,19 @@ def record_embedding_status(
         pass
 
 
+def count_eligible_embedding_chunks(kb, cfg: Dict[str, Any], repo_ids: List[str]) -> int:
+    total = 0
+    for repo_id in repo_ids:
+        if not repo_id:
+            continue
+        chunks = eligible_chunks(
+            kb.query_df("SELECT * FROM code_chunks WHERE repo_id = ? ORDER BY rel_path, start_line, kind", [repo_id]),
+            cfg,
+        )
+        total += len(chunks)
+    return total
+
+
 def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     emb = cfg.get("indexing", {}).get("embeddings", {})
     if not emb.get("enabled", False):
@@ -459,13 +487,20 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     skipped = 0
     processed = 0
 
-    repo_iterator = repos["repo_id"].fillna("").astype(str).tolist()
+    repo_ids = repos["repo_id"].fillna("").astype(str).tolist()
+    global_bar = None
     if tqdm:
-        repo_iterator = tqdm(repo_iterator, total=len(repos), desc=f"Embedding repositories via {provider}", unit="repo", position=0)
+        global_bar = tqdm(
+            total=count_eligible_embedding_chunks(kb, cfg, repo_ids),
+            desc=f"GLOBAL embeddings via {provider}",
+            unit="chunk",
+            position=0,
+        )
 
-    for repo_id in repo_iterator:
+    for repo_id in repo_ids:
         if not repo_id:
             continue
+        repo_bar = None
         index_path, meta_path = repo_vector_paths(cfg, repo_id)
         chunks = eligible_chunks(
             kb.query_df("SELECT * FROM code_chunks WHERE repo_id = ? ORDER BY rel_path, start_line, kind", [repo_id]),
@@ -504,6 +539,17 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
                     pass
 
         index, existing_meta = load_existing_repo_index(faiss, index_path, meta_path, chunks, model_name) if not rebuild else (None, pd.DataFrame())
+        if tqdm:
+            repo_bar = tqdm(
+                total=len(chunks),
+                initial=len(existing_meta),
+                desc=f"REPO embeddings {repo_id}",
+                unit="chunk",
+                position=1,
+                leave=False,
+            )
+        if global_bar is not None and len(existing_meta):
+            global_bar.update(len(existing_meta))
         if not existing_meta.empty and len(existing_meta) == len(chunks):
             replace_repo_embedding_rows(kb, repo_id, model_name, existing_meta)
             vector_dim = int(existing_meta.iloc[0]["vector_dim"]) if not existing_meta.empty else 0
@@ -524,6 +570,8 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
             total_vectors += len(existing_meta)
             total_chunks += len(chunks)
             skipped += 1
+            if repo_bar is not None:
+                repo_bar.close()
             continue
 
         existing_keys = set(zip(existing_meta["chunk_id"], existing_meta["text_sha1"])) if not existing_meta.empty else set()
@@ -547,16 +595,12 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
             details=f"pending={len(pending)}",
         )
 
-        if model is None:
-            model = load_embedder(emb)
-
-        total_batches = (len(pending) + batch_size - 1) // batch_size
-        batch_iterator = range(0, len(pending), batch_size)
-        if tqdm:
-            batch_iterator = tqdm(batch_iterator, total=total_batches, desc=f"Embedding {repo_id}", unit="batch", position=1, leave=False)
-
         batches_done = 0
         try:
+            if model is None:
+                model = load_embedder(emb)
+
+            batch_iterator = range(0, len(pending), batch_size)
             for start in batch_iterator:
                 batch = pending.iloc[start:start + batch_size]
                 texts = [chunk_payload(row, max_chars) for _, row in batch.iterrows()]
@@ -594,6 +638,10 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
                         "vector_dim": vector_dim,
                         "embedded_at": embedded_at,
                     })
+                if global_bar is not None:
+                    global_bar.update(len(batch))
+                if repo_bar is not None:
+                    repo_bar.update(len(batch))
                 batches_done += 1
                 if batches_done % checkpoint_batches == 0:
                     meta = pd.DataFrame(rows)
@@ -638,6 +686,8 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
             total_vectors += len(meta)
             total_chunks += len(chunks)
             processed += 1
+            if repo_bar is not None:
+                repo_bar.close()
         except Exception as e:
             record_embedding_status(
                 kb,
@@ -653,7 +703,14 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
                 meta_path=meta_path,
                 details=str(e),
             )
+            if repo_bar is not None:
+                repo_bar.close()
+            if global_bar is not None:
+                global_bar.close()
             raise
+
+    if global_bar is not None:
+        global_bar.close()
 
     return pd.DataFrame(), (
         f"repo-sharded: vectors={total_vectors}/{total_chunks}, repos={len(repos)}, "
@@ -671,21 +728,57 @@ def build_code_embeddings_parallel(cfg: Dict[str, Any], repo_ids: List[str], wor
     skipped = 0
     vectors = 0
     chunks = 0
+    global_bar = None
+    if tqdm:
+        from proofline.storage import KB
+
+        kb = KB(cfg["storage"]["duckdb_path"])
+        try:
+            global_bar = tqdm(
+                total=count_eligible_embedding_chunks(kb, cfg, repo_ids),
+                desc="GLOBAL embeddings",
+                unit="chunk",
+                position=0,
+            )
+        finally:
+            kb.close()
+
+    def update_global_progress(n: int) -> None:
+        if global_bar is not None:
+            global_bar.update(n)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(build_code_embeddings_for_repo, cfg, repo_id) for repo_id in repo_ids if repo_id]
+        futures = [
+            pool.submit(build_code_embeddings_for_repo, cfg, repo_id, update_global_progress if global_bar is not None else None)
+            for repo_id in repo_ids
+            if repo_id
+        ]
         iterator = as_completed(futures)
+        repo_bar = None
         if tqdm:
-            iterator = tqdm(iterator, total=len(futures), desc="Embedding repositories", unit="repo", position=0)
-        for future in iterator:
-            result = future.result()
-            completed += 1
-            skipped += int(bool(result.get("skipped")))
-            vectors += int(result.get("vectors") or 0)
-            chunks += int(result.get("chunks") or 0)
+            repo_bar = tqdm(total=0, desc="REPO embeddings", unit="chunk", position=1, leave=False)
+        try:
+            for future in iterator:
+                result = future.result()
+                completed += 1
+                skipped += int(bool(result.get("skipped")))
+                repo_vectors = int(result.get("vectors") or 0)
+                repo_chunks = int(result.get("chunks") or 0)
+                vectors += repo_vectors
+                chunks += repo_chunks
+                if repo_bar is not None:
+                    repo_bar.reset(total=repo_chunks)
+                    repo_bar.set_description(f"REPO embeddings {result.get('repo_id') or ''}")
+                    repo_bar.update(repo_vectors)
+        finally:
+            if repo_bar is not None:
+                repo_bar.close()
+            if global_bar is not None:
+                global_bar.close()
     return pd.DataFrame(), f"repo-sharded parallel: vectors={vectors}/{chunks}, repos={completed}, skipped={skipped}, workers={workers}, shard_dir={vector_shard_dir(cfg)}"
 
 
-def build_code_embeddings_for_repo(cfg: Dict[str, Any], repo_id: str) -> Dict[str, Any]:
+def build_code_embeddings_for_repo(cfg: Dict[str, Any], repo_id: str, progress_callback=None) -> Dict[str, Any]:
     from proofline.storage import KB
 
     emb = cfg.get("indexing", {}).get("embeddings", {})
@@ -725,11 +818,15 @@ def build_code_embeddings_for_repo(cfg: Dict[str, Any], repo_id: str) -> Dict[st
             replace_repo_embedding_rows(kb, repo_id, model_name, existing_meta)
             vector_dim = int(existing_meta.iloc[0]["vector_dim"]) if not existing_meta.empty else 0
             record_embedding_status(kb, repo_id=repo_id, model_name=model_name, source_fingerprint=source_fingerprint, status="ok", chunk_count=len(chunks), vector_count=len(existing_meta), vector_dim=vector_dim, started_at=started, index_path=index_path, meta_path=meta_path, details="cached")
+            if progress_callback is not None:
+                progress_callback(len(existing_meta))
             return {"repo_id": repo_id, "vectors": len(existing_meta), "chunks": len(chunks), "skipped": True}
 
         existing_keys = set(zip(existing_meta["chunk_id"], existing_meta["text_sha1"])) if not existing_meta.empty else set()
         pending = chunks[~chunks.apply(lambda r: (r["chunk_id"], r["_text_sha1"]) in existing_keys, axis=1)].reset_index(drop=True)
         rows: List[Dict[str, Any]] = existing_meta.to_dict("records") if not existing_meta.empty else []
+        if progress_callback is not None and rows:
+            progress_callback(len(rows))
         vector_dim = int(existing_meta.iloc[0]["vector_dim"]) if not existing_meta.empty else 0
         replace_repo_embedding_rows(kb, repo_id, model_name, existing_meta)
         record_embedding_status(kb, repo_id=repo_id, model_name=model_name, source_fingerprint=source_fingerprint, status="running", chunk_count=len(chunks), vector_count=len(rows), vector_dim=vector_dim, started_at=started, index_path=index_path, meta_path=meta_path, details=f"pending={len(pending)}")
@@ -766,6 +863,8 @@ def build_code_embeddings_for_repo(cfg: Dict[str, Any], repo_id: str) -> Dict[st
                     "vector_dim": vector_dim,
                     "embedded_at": embedded_at,
                 })
+            if progress_callback is not None:
+                progress_callback(len(batch))
             batches_done += 1
             if batches_done % checkpoint_batches == 0:
                 meta = pd.DataFrame(rows)

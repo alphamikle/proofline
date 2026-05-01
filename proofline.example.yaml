@@ -194,7 +194,20 @@ jira:
 indexing:
   lexical_fts: true
   chunk_write_batch_size: 5000
+  # Top-level repository parallelism for code_index. max_workers below is per-repo file parallelism.
+  repo_max_workers: 1
   max_workers: 1
+  ast_chunking:
+    enabled: true
+    source: cgc
+    fallback_regex: true
+    keep_file_windows: true
+    include_node_types: [Function, Class, Method, Module, Struct, Enum, Interface]
+    max_symbol_lines: 240
+    symbol_window_lines: 160
+    symbol_window_overlap: 30
+    include_context_prefix: true
+    dedupe_overlapping_chunks: true
   embeddings:
     enabled: true
     # sentence_transformers | openai | openai_compatible | cli
@@ -221,7 +234,7 @@ indexing:
     max_chunks: null
     min_text_chars: 80
     max_text_chars: 4096
-    include_kinds: [symbol, doc_section, file_window]
+    include_kinds: [ast_symbol, ast_function, ast_method, ast_class, ast_interface, ast_enum, ast_module, ast_struct, ast_large_symbol_window, doc_section, file_window, symbol]
     exclude_languages: [json]
     rebuild: false
     checkpoint_interval_batches: 10
@@ -258,7 +271,7 @@ code_graph:
     enabled: true
     page_size: 5000
     query_timeout_seconds: 300
-    node_types: [File, Function, Class, Module, Struct, Enum]
+    node_types: [File, Function, Class, Method, Module, Struct, Enum, Interface]
     max_symbols: null
     max_edges: null
   max_repos: null

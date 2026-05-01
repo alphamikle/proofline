@@ -75,6 +75,14 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
             continue
         pending.append((repo_id, repo_path, command, fingerprint))
 
+    global_bar = None
+    if tqdm:
+        global_bar = tqdm(total=len(pending) * (retries + 1), desc="GLOBAL code graph", unit="try", position=0)
+
+    def update_global_progress(n: int) -> None:
+        if global_bar is not None:
+            global_bar.update(n)
+
     def run_one(item: tuple[str, str, str, str]) -> Dict[str, Any]:
         repo_id, repo_path, command, fingerprint = item
         started = now_iso()
@@ -82,10 +90,11 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
             console.print(f"code graph: {repo_id}", highlight=False)
         status = "error"
         details = ""
+        attempts_done = 0
         try:
             attempts: Iterable[int] = range(retries + 1)
             if tqdm and max_workers == 1:
-                attempts = tqdm(attempts, total=retries + 1, desc=f"Code graph {repo_id}", unit="try", position=1, leave=False)
+                attempts = tqdm(attempts, total=retries + 1, desc=f"REPO code graph {repo_id}", unit="try", position=1, leave=False)
             for attempt in attempts:
                 p = subprocess.run(
                     shlex.split(command),
@@ -94,16 +103,24 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
                     text=True,
                     timeout=timeout_seconds,
                 )
+                attempts_done += 1
+                update_global_progress(1)
                 status = "ok" if p.returncode == 0 else "error"
                 details = (p.stdout + "\n" + p.stderr).strip()[:4000]
                 if status == "ok" or attempt >= retries:
                     break
+            if attempts_done < retries + 1:
+                update_global_progress((retries + 1) - attempts_done)
         except subprocess.TimeoutExpired as e:
             status = "timeout"
             details = f"timed out after {timeout_seconds}s: {e}"
+            if attempts_done < retries + 1:
+                update_global_progress((retries + 1) - attempts_done)
         except Exception as e:
             status = "error"
             details = str(e)
+            if attempts_done < retries + 1:
+                update_global_progress((retries + 1) - attempts_done)
         return {
             "repo_id": repo_id,
             "repo_path": repo_path,
@@ -116,23 +133,38 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
         }
 
     if max_workers > 1 and len(pending) > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(run_one, item) for item in pending]
-            iterator: Iterable[Any] = as_completed(futures)
-            if tqdm:
-                iterator = tqdm(iterator, total=len(futures), desc="Indexing code graph", unit="repo", position=0)
-            for future in iterator:
-                row = future.result()
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(run_one, item) for item in pending]
+                iterator: Iterable[Any] = as_completed(futures)
+                repo_bar = None
+                if tqdm:
+                    repo_bar = tqdm(total=1, desc="REPO code graph", unit="repo", position=1, leave=False)
+                try:
+                    for future in iterator:
+                        row = future.result()
+                        rows.append(row)
+                        _record_code_graph_run(kb, row, quiet=bool(tqdm))
+                        if repo_bar is not None:
+                            repo_bar.reset(total=1)
+                            repo_bar.set_description(f"REPO code graph {row.get('repo_id') or ''}")
+                            repo_bar.update(1)
+                finally:
+                    if repo_bar is not None:
+                        repo_bar.close()
+        finally:
+            if global_bar is not None:
+                global_bar.close()
+    else:
+        try:
+            iterator = pending
+            for item in iterator:
+                row = run_one(item)
                 rows.append(row)
                 _record_code_graph_run(kb, row, quiet=bool(tqdm))
-    else:
-        iterator = pending
-        if tqdm:
-            iterator = tqdm(iterator, total=len(pending), desc="Indexing code graph", unit="repo", position=0)
-        for item in iterator:
-            row = run_one(item)
-            rows.append(row)
-            _record_code_graph_run(kb, row, quiet=bool(tqdm))
+        finally:
+            if global_bar is not None:
+                global_bar.close()
     return pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in rows])
 
 
@@ -182,7 +214,7 @@ def import_code_graph(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFra
     repo_index = _repo_index(kb.query_df("SELECT repo_id, repo_path FROM repo_inventory ORDER BY length(repo_path) DESC"))
 
     symbol_rows: dict[str, Dict[str, Any]] = {}
-    for node_type in import_cfg.get("node_types") or ["File", "Function", "Class", "Module", "Struct", "Enum"]:
+    for node_type in import_cfg.get("node_types") or ["File", "Function", "Class", "Method", "Module", "Struct", "Enum", "Interface"]:
         query = _symbol_query(str(node_type))
         for row in _paged_cgc_query(cgc, query, page_size, timeout, max_rows=max_symbols):
             sym = _symbol_row(row, repo_index)

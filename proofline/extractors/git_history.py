@@ -6,7 +6,7 @@ import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -48,9 +48,12 @@ def extract_repo_git_history(
     *,
     progress_desc: str | None = None,
     progress_position: int = 1,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    commits: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     prepare_git_history(repo, cfg)
-    commits = extract_commits(repo, repo_id, cfg)
+    if commits is None:
+        commits = extract_commits(repo, repo_id, cfg)
     commit_by_sha = {str(c["commit_sha"]): c for c in commits}
     file_changes: List[Dict[str, Any]] = []
     hunks: List[Dict[str, Any]] = []
@@ -82,6 +85,8 @@ def extract_repo_git_history(
                 "confidence": 0.9 if commit.get("reverts_commit_sha") else 0.55,
                 "evidence": commit.get("subject") or "",
             })
+        if progress_callback is not None:
+            progress_callback(1)
 
     blame = extract_current_blame(repo, repo_id, cfg)
     cochange = build_cochange_edges(repo_id, file_changes, commit_by_sha, cfg)
@@ -104,10 +109,11 @@ def extract_repo_git_blame(
     *,
     progress_desc: str | None = None,
     progress_position: int = 1,
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     gh_cfg = dict(_git_history_cfg({"git_history": cfg}))
     gh_cfg["current_blame"] = True
-    return {"git_blame_current": extract_current_blame(repo, repo_id, gh_cfg, progress_desc=progress_desc, progress_position=progress_position)}
+    return {"git_blame_current": extract_current_blame(repo, repo_id, gh_cfg, progress_desc=progress_desc, progress_position=progress_position, progress_callback=progress_callback)}
 
 
 def prepare_git_history(repo: Path, cfg: Dict[str, Any]) -> None:
@@ -288,6 +294,7 @@ def extract_current_blame(
     *,
     progress_desc: str | None = None,
     progress_position: int = 1,
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> List[Dict[str, Any]]:
     if not cfg.get("current_blame", True):
         return []
@@ -310,6 +317,8 @@ def extract_current_blame(
             break
         raw = run_cmd(["git", "blame", "--line-porcelain", *ignore_args, "--", rel], cwd=repo, timeout=120)
         rows.extend(compact_blame(repo_id, rel, raw, bool(ignore_args)))
+        if progress_callback is not None:
+            progress_callback(1)
     return rows
 
 

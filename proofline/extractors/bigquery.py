@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
+from proofline.progress import progress_iter
 from proofline.utils import json_dumps, stable_id
 
 
@@ -25,10 +26,10 @@ def pull_bq_jobs(cfg: Dict[str, Any]) -> pd.DataFrame:
     except Exception as e:
         return pd.DataFrame([_error_row(str(e))])
     max_results = bq.get("max_results")
-    for region in bq.get("regions", ["region-us"]):
-        for days in bq.get("windows_days", [30]):
-            limit_sql = f"LIMIT {int(max_results)}" if max_results else ""
-            sql = f"""
+    tasks = [(region, days) for region in bq.get("regions", ["region-us"]) for days in bq.get("windows_days", [30])]
+    for region, days in progress_iter(tasks, total=len(tasks), desc="BigQuery jobs", unit="window"):
+        limit_sql = f"LIMIT {int(max_results)}" if max_results else ""
+        sql = f"""
             SELECT
               creation_time,
               project_id,
@@ -50,33 +51,33 @@ def pull_bq_jobs(cfg: Dict[str, Any]) -> pd.DataFrame:
               AND state = 'DONE'
             {limit_sql}
             """
-            try:
-                df = client.query(sql).result().to_dataframe(create_bqstorage_client=False)
-            except Exception as e:
-                rows.append(_error_row(f"{region}: {e}"))
-                continue
-            for _, r in df.iterrows():
-                refs = []
-                for item in r.get("referenced_tables") or []:
-                    try:
-                        refs.append(f"{item['project_id']}.{item['dataset_id']}.{item['table_id']}")
-                    except Exception:
-                        pass
-                dest = ""
-                if r.get("dest_project") and r.get("dest_dataset") and r.get("dest_table"):
-                    dest = f"{r.get('dest_project')}.{r.get('dest_dataset')}.{r.get('dest_table')}"
-                rows.append({
-                    "job_id": str(r.get("job_id") or ""),
-                    "project_id": str(r.get("project_id") or ""),
-                    "user_email": str(r.get("user_email") or ""),
-                    "creation_time": str(r.get("creation_time") or ""),
-                    "query_hash": str(r.get("query_hash") or ""),
-                    "referenced_tables": json_dumps(refs),
-                    "destination_table": dest,
-                    "total_bytes_processed": int(r.get("total_bytes_processed") or 0),
-                    "total_slot_ms": int(r.get("total_slot_ms") or 0),
-                    "raw": json_dumps({"region": region, "window_days": days}),
-                })
+        try:
+            df = client.query(sql).result().to_dataframe(create_bqstorage_client=False)
+        except Exception as e:
+            rows.append(_error_row(f"{region}: {e}"))
+            continue
+        for _, r in progress_iter(df.iterrows(), total=len(df), desc=f"BigQuery rows {region} {days}d", unit="job", leave=False):
+            refs = []
+            for item in r.get("referenced_tables") or []:
+                try:
+                    refs.append(f"{item['project_id']}.{item['dataset_id']}.{item['table_id']}")
+                except Exception:
+                    pass
+            dest = ""
+            if r.get("dest_project") and r.get("dest_dataset") and r.get("dest_table"):
+                dest = f"{r.get('dest_project')}.{r.get('dest_dataset')}.{r.get('dest_table')}"
+            rows.append({
+                "job_id": str(r.get("job_id") or ""),
+                "project_id": str(r.get("project_id") or ""),
+                "user_email": str(r.get("user_email") or ""),
+                "creation_time": str(r.get("creation_time") or ""),
+                "query_hash": str(r.get("query_hash") or ""),
+                "referenced_tables": json_dumps(refs),
+                "destination_table": dest,
+                "total_bytes_processed": int(r.get("total_bytes_processed") or 0),
+                "total_slot_ms": int(r.get("total_slot_ms") or 0),
+                "raw": json_dumps({"region": region, "window_days": days}),
+            })
     return pd.DataFrame(rows)
 
 

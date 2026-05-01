@@ -416,7 +416,7 @@ def build(
     """Build local indexes, entity resolution, graph, and capability maps."""
     selected = (target or "all").replace("-", "_")
     groups = {
-        "all": ["history", "blame", "code", "embeddings", "api", "code-graph", "static", "identity", "graph", "endpoints", "capabilities"],
+        "all": ["history", "blame", "code-graph", "code", "embeddings", "api", "static", "identity", "graph", "endpoints", "capabilities"],
         "history": ["history"],
         "change_history": ["history"],
         "blame": ["blame"],

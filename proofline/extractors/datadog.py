@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
+from proofline.progress import progress_bar, progress_iter
 from proofline.utils import dd_time_window, epoch_window, flatten_json, json_dumps, pick_first, stable_id
 
 SITE_HOSTS = {
@@ -70,30 +71,30 @@ def pull_service_dependencies(cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.Dat
         return pd.DataFrame(services_rows), pd.DataFrame(edge_rows)
     envs = cfg["datadog"].get("envs", ["prod"])
     windows = cfg["datadog"].get("windows_days", [30])
-    for env in envs:
-        for days in windows:
-            start, end = epoch_window(int(days))
-            try:
-                data = client.get("/api/v1/service_dependencies", params={"env": env, "start": start, "end": end})
-            except Exception as e:
+    tasks = [(env, days) for env in envs for days in windows]
+    for env, days in progress_iter(tasks, total=len(tasks), desc="Datadog service dependencies", unit="window"):
+        start, end = epoch_window(int(days))
+        try:
+            data = client.get("/api/v1/service_dependencies", params={"env": env, "start": start, "end": end})
+        except Exception as e:
+            edge_rows.append({
+                "from_service": "__error__", "to_service": str(e), "env": env,
+                "window_days": int(days), "source": "datadog_service_dependencies_error",
+                "first_seen": "", "last_seen": "", "confidence": 0.0, "raw": json_dumps({"error": str(e)}),
+            })
+            continue
+        for svc, meta in (data or {}).items():
+            services_rows.append({
+                "datadog_service": svc, "env": env, "raw": json_dumps(meta),
+                "source": "datadog_service_dependencies", "pulled_at": datetime.now(timezone.utc).isoformat(),
+            })
+            for called in (meta or {}).get("calls", []) or []:
                 edge_rows.append({
-                    "from_service": "__error__", "to_service": str(e), "env": env,
-                    "window_days": int(days), "source": "datadog_service_dependencies_error",
-                    "first_seen": "", "last_seen": "", "confidence": 0.0, "raw": json_dumps({"error": str(e)}),
+                    "from_service": svc, "to_service": called, "env": env,
+                    "window_days": int(days), "source": "datadog_service_dependencies",
+                    "first_seen": "", "last_seen": "", "confidence": 0.85,
+                    "raw": json_dumps(meta),
                 })
-                continue
-            for svc, meta in (data or {}).items():
-                services_rows.append({
-                    "datadog_service": svc, "env": env, "raw": json_dumps(meta),
-                    "source": "datadog_service_dependencies", "pulled_at": datetime.now(timezone.utc).isoformat(),
-                })
-                for called in (meta or {}).get("calls", []) or []:
-                    edge_rows.append({
-                        "from_service": svc, "to_service": called, "env": env,
-                        "window_days": int(days), "source": "datadog_service_dependencies",
-                        "first_seen": "", "last_seen": "", "confidence": 0.85,
-                        "raw": json_dumps(meta),
-                    })
     return pd.DataFrame(services_rows), pd.DataFrame(edge_rows)
 
 
@@ -103,12 +104,15 @@ def pull_service_definitions(cfg: Dict[str, Any]) -> pd.DataFrame:
     if not cfg.get("datadog", {}).get("enabled", True) or not client.enabled:
         return pd.DataFrame(rows)
     page = 0
+    bar = progress_bar(desc="Datadog service definitions", unit="page")
     while True:
         try:
             data = client.get("/api/v2/services/definitions", params={"page[size]": 100, "page[number]": page})
         except Exception as e:
             rows.append({"datadog_service": "__error__", "env": "", "raw": json_dumps({"error": str(e)}), "source": "datadog_service_definitions_error", "pulled_at": datetime.now(timezone.utc).isoformat()})
             break
+        if bar:
+            bar.update(1)
         items = data.get("data", []) if isinstance(data, dict) else []
         if not items:
             break
@@ -126,6 +130,8 @@ def pull_service_definitions(cfg: Dict[str, Any]) -> pd.DataFrame:
         page += 1
         if page > 1000:
             break
+    if bar:
+        bar.close()
     return pd.DataFrame(rows)
 
 
@@ -137,7 +143,8 @@ def search_spans(cfg: Dict[str, Any]) -> pd.DataFrame:
     if not dd.get("enabled", True) or not spans_cfg.get("enabled", True) or not client.enabled:
         return pd.DataFrame(rows)
     aliases = dd.get("field_aliases", {})
-    for days in dd.get("windows_days", [30]):
+    windows = dd.get("windows_days", [30])
+    for days in progress_iter(windows, total=len(windows), desc="Datadog spans windows", unit="window"):
         start, end = dd_time_window(int(days))
         body = {
             "data": {
@@ -151,7 +158,7 @@ def search_spans(cfg: Dict[str, Any]) -> pd.DataFrame:
         }
         cursor = None
         max_pages = int(spans_cfg.get("max_pages_per_window", 20))
-        for _ in range(max_pages):
+        for _ in progress_iter(range(max_pages), total=max_pages, desc=f"Datadog spans {days}d", unit="page", leave=False):
             if cursor:
                 body["data"]["attributes"]["page"]["cursor"] = cursor
             try:
@@ -175,7 +182,8 @@ def search_logs(cfg: Dict[str, Any]) -> pd.DataFrame:
     if not dd.get("enabled", True) or not logs_cfg.get("enabled", True) or not client.enabled:
         return pd.DataFrame(rows)
     aliases = dd.get("field_aliases", {})
-    for days in dd.get("windows_days", [30]):
+    windows = dd.get("windows_days", [30])
+    for days in progress_iter(windows, total=len(windows), desc="Datadog logs windows", unit="window"):
         start, end = dd_time_window(int(days))
         body = {
             "filter": {"from": start, "to": end, "query": logs_cfg.get("query", "*")},
@@ -184,7 +192,7 @@ def search_logs(cfg: Dict[str, Any]) -> pd.DataFrame:
         }
         cursor = None
         max_pages = int(logs_cfg.get("max_pages_per_window", 20))
-        for _ in range(max_pages):
+        for _ in progress_iter(range(max_pages), total=max_pages, desc=f"Datadog logs {days}d", unit="page", leave=False):
             if cursor:
                 body["page"]["cursor"] = cursor
             try:
