@@ -253,6 +253,60 @@
             },
             "batch_size": { "$ref": "#/definitions/positiveInteger" },
             "max_workers": { "$ref": "#/definitions/positiveInteger" },
+            "cluster_max_workers": {
+              "$ref": "#/definitions/nullablePositiveInteger",
+              "description": "Optional global cap for concurrent embedding server calls. Defaults to the sum of per-server max_workers."
+            },
+            "servers": {
+              "type": "array",
+              "description": "Optional cluster of embedding workers. Each server has its own provider/batch/concurrency/API config and falls back to top-level model settings when omitted.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": ["string", "null"] },
+                  "enabled": { "type": "boolean", "default": true },
+                  "provider": {
+                    "type": ["string", "null"],
+                    "enum": ["sentence_transformers", "openai", "openai_compatible", "cli", null],
+                    "description": "Embedding provider for this server. Defaults to embeddings.provider."
+                  },
+                  "model_name": { "type": ["string", "null"] },
+                  "model_id": {
+                    "type": ["string", "null"],
+                    "description": "Optional stable identity for this server. Use top-level embeddings.model_id for shard identity across the whole cluster."
+                  },
+                  "base_url": {
+                    "type": ["string", "null"],
+                    "description": "Base URL for this OpenAI-compatible embedding server."
+                  },
+                  "base_url_env": {
+                    "type": ["string", "null"],
+                    "description": "Environment variable containing this server's base URL."
+                  },
+                  "api_key_env": {
+                    "type": ["string", "null"],
+                    "description": "Environment variable containing this server's API key. Use an empty string for no API key."
+                  },
+                  "command": {
+                    "type": ["string", "null"],
+                    "description": "Command for provider=cli on this node."
+                  },
+                  "device": {
+                    "type": ["string", "null"],
+                    "description": "Device for provider=sentence_transformers on this node."
+                  },
+                  "batch_size": { "$ref": "#/definitions/positiveInteger" },
+                  "max_workers": {
+                    "$ref": "#/definitions/positiveInteger",
+                    "description": "Maximum concurrent embedding calls to this server."
+                  },
+                  "dimensions": { "$ref": "#/definitions/nullablePositiveInteger" },
+                  "normalize_embeddings": { "type": ["boolean", "null"] },
+                  "request_timeout_seconds": { "$ref": "#/definitions/positiveInteger" }
+                }
+              }
+            },
             "dimensions": { "$ref": "#/definitions/nullablePositiveInteger" },
             "normalize_embeddings": { "type": "boolean", "default": true },
             "request_timeout_seconds": { "$ref": "#/definitions/positiveInteger" },

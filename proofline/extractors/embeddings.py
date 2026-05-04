@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -109,10 +110,50 @@ def embedding_provider(emb: Dict[str, Any]) -> str:
     return provider
 
 
+def embedding_servers(emb: Dict[str, Any]) -> List[Dict[str, Any]]:
+    servers = emb.get("servers")
+    if not isinstance(servers, list):
+        return []
+    out = []
+    for idx, server in enumerate(servers):
+        if not isinstance(server, dict):
+            raise RuntimeError(f"embeddings.servers[{idx}] must be an object")
+        if server.get("enabled", True):
+            out.append(server)
+    return out
+
+
+def embedding_batch_size(emb: Dict[str, Any], default: int = 4) -> int:
+    servers = embedding_servers(emb)
+    if not servers:
+        return max(1, int(emb.get("batch_size") or default))
+    total = 0
+    for server in servers:
+        server_batch = max(1, int(server.get("batch_size") or emb.get("batch_size") or default))
+        server_workers = max(1, int(server.get("max_workers") or 1))
+        total += server_batch * server_workers
+    return max(1, total)
+
+
 def embedding_model_id(emb: Dict[str, Any]) -> str:
     configured = str(emb.get("model_id") or "").strip()
     if configured:
         return configured
+    servers = embedding_servers(emb)
+    if servers:
+        models = sorted({
+            str(server.get("model_name") or emb.get("model_name") or "Qwen/Qwen3-Embedding-0.6B").strip()
+            for server in servers
+        })
+        model_name = models[0] if len(models) == 1 else hashlib.sha1("|".join(models).encode("utf-8", errors="ignore")).hexdigest()[:12]
+        suffix = ""
+        dimensions = emb.get("dimensions")
+        server_dimensions = {server.get("dimensions") for server in servers if server.get("dimensions") is not None}
+        if dimensions is not None:
+            suffix += f":dim{int(dimensions)}"
+        elif len(server_dimensions) == 1:
+            suffix += f":dim{int(next(iter(server_dimensions)))}"
+        return f"cluster:{model_name}{suffix}"
     provider = embedding_provider(emb)
     model_name = str(emb.get("model_name") or "Qwen/Qwen3-Embedding-0.6B").strip()
     if provider == "sentence_transformers":
@@ -121,7 +162,9 @@ def embedding_model_id(emb: Dict[str, Any]) -> str:
     if emb.get("dimensions") is not None:
         suffix += f":dim{int(emb['dimensions'])}"
     if provider in {"openai", "openai_compatible"}:
-        base = embedding_base_url(emb, "https://api.openai.com/v1" if provider == "openai" else None) or ""
+        base = ""
+        if not embedding_servers(emb):
+            base = embedding_base_url(emb, "https://api.openai.com/v1" if provider == "openai" else None) or ""
         if base:
             suffix += ":" + hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:8]
     if model_name:
@@ -132,6 +175,8 @@ def embedding_model_id(emb: Dict[str, Any]) -> str:
 
 
 def load_embedder(emb: Dict[str, Any]):
+    if embedding_servers(emb):
+        return ClusterEmbeddingProvider(emb)
     provider = embedding_provider(emb)
     if provider == "sentence_transformers":
         model_name = str(emb.get("model_name") or "Qwen/Qwen3-Embedding-0.6B")
@@ -262,6 +307,113 @@ class CLIEmbeddingProvider:
         import numpy as np
 
         return np.asarray(vectors, dtype="float32")
+
+
+class ClusterEmbeddingProvider:
+    def __init__(self, emb: Dict[str, Any]):
+        self.emb = emb
+        self.nodes = []
+        for idx, server in enumerate(embedding_servers(emb)):
+            node_cfg = dict(emb)
+            node_cfg.pop("servers", None)
+            node_cfg.pop("cluster_max_workers", None)
+            node_cfg.update({k: v for k, v in server.items() if v is not None})
+            node_name = str(server.get("name") or server.get("base_url") or server.get("command") or f"server-{idx + 1}")
+            node_batch_size = max(1, int(node_cfg.get("batch_size") or emb.get("batch_size") or 4))
+            node_workers = max(1, int(node_cfg.get("max_workers") or 1))
+            self.nodes.append({
+                "name": node_name,
+                "embedder": load_embedder(node_cfg),
+                "batch_size": node_batch_size,
+                "max_workers": node_workers,
+                "semaphore": threading.Semaphore(node_workers),
+            })
+        if not self.nodes:
+            raise RuntimeError("embeddings.servers does not contain any enabled servers")
+        total_workers = sum(int(node["max_workers"]) for node in self.nodes)
+        self.max_workers = max(1, int(emb.get("cluster_max_workers") or total_workers))
+        self._next_node = 0
+
+    def encode(
+        self,
+        texts: List[str],
+        batch_size: int | None = None,
+        convert_to_numpy: bool = True,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+    ):
+        import numpy as np
+
+        if not texts:
+            return np.asarray([], dtype="float32")
+        assignments = self._assign_texts(texts)
+        results: List[Any] = [None] * len(assignments)
+        workers = min(self.max_workers, len(assignments))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    self._encode_assignment,
+                    assignment,
+                    convert_to_numpy,
+                    normalize_embeddings,
+                    show_progress_bar,
+                ): idx
+                for idx, assignment in enumerate(assignments)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                node_name = assignments[idx]["node"]["name"]
+                try:
+                    results[idx] = np.asarray(future.result(), dtype="float32")
+                except Exception as e:
+                    raise RuntimeError(f"Embedding server {node_name} failed: {e}") from e
+
+        vectors_by_index: Dict[int, Any] = {}
+        for assignment, vectors in zip(assignments, results):
+            if vectors.ndim != 2 or vectors.shape[0] != len(assignment["indexes"]):
+                raise RuntimeError(f"Embedding server {assignment['node']['name']} returned unexpected shape: {vectors.shape}")
+            for source_index, vector in zip(assignment["indexes"], vectors):
+                vectors_by_index[int(source_index)] = vector
+        ordered = [vectors_by_index[i] for i in range(len(texts))]
+        return np.asarray(ordered, dtype="float32")
+
+    def _encode_assignment(
+        self,
+        assignment: Dict[str, Any],
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        show_progress_bar: bool,
+    ):
+        node = assignment["node"]
+        with node["semaphore"]:
+            return node["embedder"].encode(
+                assignment["texts"],
+                batch_size=int(node["batch_size"]),
+                convert_to_numpy=convert_to_numpy,
+                normalize_embeddings=normalize_embeddings,
+                show_progress_bar=show_progress_bar,
+            )
+
+    def _assign_texts(self, texts: List[str]) -> List[Dict[str, Any]]:
+        slots = []
+        for node in self.nodes:
+            slots.extend([node] * int(node["max_workers"]))
+        start_slot = self._next_node % len(slots)
+        self._next_node = (self._next_node + 1) % len(slots)
+        assignments = []
+        source_index = 0
+        slot_offset = 0
+        while source_index < len(texts):
+            node = slots[(start_slot + slot_offset) % len(slots)]
+            slot_offset += 1
+            size = min(int(node["batch_size"]), len(texts) - source_index)
+            assignments.append({
+                "node": node,
+                "indexes": list(range(source_index, source_index + size)),
+                "texts": texts[source_index:source_index + size],
+            })
+            source_index += size
+        return assignments
 
 
 def parse_embedding_response(data: Dict[str, Any]) -> List[List[float]]:
@@ -455,7 +607,7 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     model_name = embedding_model_id(emb)
     provider = embedding_provider(emb)
     device = str(emb.get("device") or "cpu")
-    batch_size = max(1, int(emb.get("batch_size", 4)))
+    batch_size = embedding_batch_size(emb)
     max_chars = int(emb.get("max_text_chars", 4096))
     checkpoint_batches = max(1, int(emb.get("checkpoint_interval_batches", 10)))
     resolved_device = resolve_device(device)
@@ -789,7 +941,7 @@ def build_code_embeddings_for_repo(cfg: Dict[str, Any], repo_id: str, progress_c
     try:
         rebuild = bool(emb.get("rebuild", False))
         model_name = embedding_model_id(emb)
-        batch_size = max(1, int(emb.get("batch_size", 4)))
+        batch_size = embedding_batch_size(emb)
         max_chars = int(emb.get("max_text_chars", 4096))
         checkpoint_batches = max(1, int(emb.get("checkpoint_interval_batches", 10)))
         index_path, meta_path = repo_vector_paths(cfg, repo_id)

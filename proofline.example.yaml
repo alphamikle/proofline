@@ -226,6 +226,29 @@ indexing:
     device: auto
     batch_size: 4
     max_workers: 1
+    cluster_max_workers: null
+    # Optional embedding cluster. Every server can define its own provider,
+    # batch_size, max_workers, timeout, API settings, command, or device.
+    # model_name falls back to the top-level value when omitted.
+    servers: []
+    # servers:
+    #   - name: mac-studio
+    #     provider: openai_compatible
+    #     base_url: http://mac-studio.local:11434/v1
+    #     api_key_env: ""
+    #     batch_size: 64
+    #     max_workers: 2
+    #   - name: linux-box
+    #     provider: cli
+    #     command: "/opt/embed/bin/embed-qwen"
+    #     batch_size: 16
+    #     max_workers: 1
+    #   - name: api-provider
+    #     provider: openai_compatible
+    #     base_url: https://embeddings.vendor.example/v1
+    #     api_key_env: VENDOR_EMBEDDINGS_API_KEY
+    #     batch_size: 128
+    #     max_workers: 4
     dimensions: null
     normalize_embeddings: true
     request_timeout_seconds: 600

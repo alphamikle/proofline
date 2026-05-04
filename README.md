@@ -244,6 +244,65 @@ AST chunks are stored in `code_chunks` with stable kinds such as `ast_function`,
 and `ast_large_symbol_window`. Default embedding `include_kinds` includes these
 AST-aware chunks plus `doc_section`, `file_window`, and fallback `symbol` chunks.
 
+Embedding can be spread across multiple workers. Each worker has its own
+provider, batch size, concurrency, timeout, and connection settings:
+
+```yaml
+indexing:
+  embeddings:
+    model_name: Qwen/Qwen3-Embedding-0.6B
+    model_id: qwen3-embedding-shared
+    servers:
+      - name: mac-studio
+        provider: openai_compatible
+        base_url: http://mac-studio.local:11434/v1
+        api_key_env: ""
+        batch_size: 64
+        max_workers: 2
+      - name: linux-box
+        provider: cli
+        command: "/opt/embed/bin/embed-qwen"
+        batch_size: 16
+        max_workers: 1
+      - name: api-provider
+        provider: openai_compatible
+        base_url: https://embeddings.vendor.example/v1
+        api_key_env: VENDOR_EMBEDDINGS_API_KEY
+        batch_size: 128
+        max_workers: 4
+      - name: local-gpu
+        provider: sentence_transformers
+        device: cuda
+        batch_size: 32
+        max_workers: 1
+```
+
+Server values fall back to the top-level embedding config when omitted, so common
+settings like `model_name`, `dimensions`, and `normalize_embeddings` can be
+defined once. `batch_size` and `max_workers` are read per server; Proofline uses
+their combined capacity when feeding the cluster. Set a top-level `model_id` when
+different providers expose the same embedding model under different names.
+
+For a homogeneous HTTP cluster, the config can stay compact:
+
+```yaml
+indexing:
+  embeddings:
+    provider: openai_compatible
+    model_name: Qwen/Qwen3-Embedding-0.6B
+    servers:
+      - name: mac-studio
+        base_url: http://mac-studio.local:11434/v1
+        api_key_env: ""
+        batch_size: 64
+        max_workers: 2
+      - name: linux-box
+        base_url: http://linux-box.local:11434/v1
+        api_key_env: ""
+        batch_size: 32
+        max_workers: 1
+```
+
 ## Ask Questions
 
 Impact analysis:
