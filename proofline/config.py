@@ -95,6 +95,7 @@ def minimal_default_config() -> Dict[str, Any]:
         "retrieval": {"reranker": {"enabled": True}},
         "graph_backend": {"enabled": False, "provider": "neo4j"},
         "code_graph": {"enabled": False},
+        "visualization": {"output_path": ""},
         "agent": {"provider": "none"},
     }
 
@@ -242,6 +243,8 @@ def load_config(path: str | Path, *, quiet: bool = False) -> Dict[str, Any]:
     path = Path(path)
     cfg, _ = migrate_config_file(path, quiet=quiet)
     cfg = _expand_env(cfg)
+    cfg["_config_path"] = str(path)
+    cfg["_config_dir"] = str(path.parent)
     _normalize_graph_backend(cfg)
     root = Path(cfg.get("workspace", "./data"))
     cfg["workspace"] = str(root)
@@ -250,6 +253,8 @@ def load_config(path: str | Path, *, quiet: bool = False) -> Dict[str, Any]:
     cfg["storage"].setdefault("sqlite_fts_path", str(root / "indexes" / "code_fts.sqlite"))
     cfg["storage"].setdefault("vector_index_path", str(root / "indexes" / "code_vectors.faiss"))
     cfg["storage"].setdefault("vector_meta_path", str(root / "indexes" / "code_vectors_meta.parquet"))
+    cfg.setdefault("visualization", {})
+    cfg["visualization"].setdefault("output_path", str(root / "visualization" / "graph.json"))
     cfg.setdefault("repos", {})
     cfg["repos"].setdefault("root", "./repos")
     cfg.setdefault("git_history", {})
@@ -295,6 +300,7 @@ def ensure_dirs(cfg: Dict[str, Any]) -> None:
         root / "normalized",
         root / "indexes",
         root / "reports",
+        root / "visualization",
     ]:
         sub.mkdir(parents=True, exist_ok=True)
     Path(cfg["storage"]["duckdb_path"]).parent.mkdir(parents=True, exist_ok=True)

@@ -39,8 +39,18 @@ def run_cmd(cmd: List[str], cwd: str | Path | None = None, timeout: int = 30) ->
         return ""
 
 
+def _json_safe(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def json_dumps(obj: Any) -> str:
-    return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+    return orjson.dumps(_json_safe(obj), option=orjson.OPT_SORT_KEYS).decode("utf-8")
 
 
 def json_loads(s: str | bytes | None) -> Any:

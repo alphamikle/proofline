@@ -376,6 +376,20 @@ def run(
     run_order(config_path(config), from_stage, to_stage)
 
 
+@app.command("mcp")
+def mcp_server(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    transport: str = typer.Option("stdio", "--transport"),
+) -> None:
+    """Start a read-only MCP server over the local Proofline KB."""
+    allowed = {"stdio", "streamable-http", "sse"}
+    if transport not in allowed:
+        raise typer.BadParameter(f"Unsupported transport: {transport}. Expected one of: {', '.join(sorted(allowed))}")
+    from proofline.mcp_server import serve
+
+    serve(config_path(config), transport)
+
+
 @app.command()
 def stage(
     name: str = typer.Argument(...),
@@ -416,7 +430,7 @@ def build(
     """Build local indexes, entity resolution, graph, and capability maps."""
     selected = (target or "all").replace("-", "_")
     groups = {
-        "all": ["history", "blame", "code-graph", "code", "embeddings", "api", "static", "identity", "graph", "endpoints", "capabilities"],
+        "all": ["history", "blame", "code-graph", "code", "embeddings", "api", "static", "identity", "graph", "endpoints", "capabilities", "visualization"],
         "history": ["history"],
         "change_history": ["history"],
         "blame": ["blame"],
@@ -430,6 +444,8 @@ def build(
         "endpoints": ["endpoints"],
         "endpoint_map": ["endpoints"],
         "capabilities": ["capabilities"],
+        "visualization": ["visualization"],
+        "visual": ["visualization"],
     }
     if selected not in groups:
         raise typer.BadParameter(f"Unknown build target: {target}")
@@ -440,6 +456,23 @@ def build(
 def publish(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
     """Publish the local graph into the configured external graph backend."""
     run_named_stage("publish", config)
+
+
+@app.command()
+def visualize(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port"),
+    refresh: bool = typer.Option(False, "--refresh", help="Rebuild visualization JSON before starting the UI."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the browser automatically."),
+) -> None:
+    """Start the local Proofline visualization UI."""
+    from proofline.visualization import serve_visualization
+
+    setup_logging()
+    cfg = load_config(config_path(config))
+    ensure_dirs(cfg)
+    serve_visualization(cfg, host=host, port=port, open_browser=not no_browser, rebuild=refresh)
 
 
 @app.command()
@@ -468,6 +501,7 @@ def status(
             "edges",
             "endpoint_dependency_map",
             "data_capabilities",
+            "visualization_exports",
         ]
         counts = {}
         for table in tables:

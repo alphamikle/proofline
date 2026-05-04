@@ -396,6 +396,16 @@
         "retries": { "$ref": "#/definitions/nonNegativeInteger" }
       }
     },
+    "visualization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "output_path": {
+          "type": "string",
+          "description": "Path where visualization-ready graph projections are written."
+        }
+      }
+    },
     "agent": {
       "type": "object",
       "additionalProperties": false,

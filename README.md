@@ -216,6 +216,7 @@ data        -> bigquery
 identity    -> entity_resolution
 endpoints   -> endpoint_map
 publish     -> external graph backend projection
+visual      -> local visualization projections
 ```
 
 AST-aware chunking is configured under `indexing.ast_chunking`:
@@ -348,6 +349,45 @@ Search:
 proofline search "payment eligibility" --project checkout-api
 ```
 
+## MCP Server
+
+Proofline includes a read-only MCP server for external LLM clients. It exposes
+schema discovery, safe paginated SQL `SELECT`/`WITH`, code search, file slices
+from indexed `repo_files`, graph traversal, evidence retrieval, history, API/data
+metadata, and capped raw artifact reads. It does not expose write, sync, build,
+publish, shell, or pipeline operations.
+
+Stdio transport:
+
+```bash
+proofline mcp --config /abs/path/proofline.yaml
+```
+
+Example client config:
+
+```json
+{
+  "mcpServers": {
+    "proofline": {
+      "command": "/path/to/python",
+      "args": ["-m", "proofline", "mcp", "--config", "/abs/path/proofline.yaml"]
+    }
+  }
+}
+```
+
+HTTP transport:
+
+```bash
+proofline mcp --config proofline.yaml --transport streamable-http
+```
+
+The default FastMCP HTTP endpoint is usually:
+
+```text
+http://localhost:8000/mcp
+```
+
 ## External Graph Backend
 
 Graph publishing is configured through `graph_backend`:
@@ -367,6 +407,21 @@ Publish with:
 ```bash
 proofline publish
 ```
+
+## Local Visualization
+
+Proofline can build a separate visualization layer on top of the existing
+evidence tables. This does not mutate `nodes`, `edges`, `service_identity`,
+runtime, static, or code index tables; it writes a compact JSON artifact for the
+viewer.
+
+```bash
+proofline stage visualization
+proofline visualize
+```
+
+Use `proofline visualize --refresh` to rebuild the JSON before starting the
+local UI server. The default artifact is `data/visualization/graph.json`.
 
 ## LLM Answers
 

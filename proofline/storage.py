@@ -323,6 +323,12 @@ class KB:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS visualization_exports (
+              exported_at TEXT, output_path TEXT, projections TEXT,
+              node_count BIGINT, edge_count BIGINT, status TEXT, details TEXT
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS pipeline_runs (
               stage TEXT, started_at TEXT, finished_at TEXT, status TEXT, details TEXT
             )

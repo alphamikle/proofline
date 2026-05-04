@@ -38,6 +38,7 @@ from proofline.extractors.embeddings import build_code_embeddings
 from proofline.extractors.graph_backend import publish_graph_backend
 from proofline.extractors.code_graph import import_code_graph, run_code_graph_index
 from proofline.pipeline.repo_jobs import mark_repo_stage, max_workers, repo_stage_done
+from proofline.visualization import build_visualization_artifacts
 
 app = typer.Typer(help="Proofline pipeline")
 
@@ -1104,6 +1105,15 @@ def stage_publish(kb: KB, cfg: Dict[str, Any]) -> None:
     console.print(f"publish: {row.get('status')}, nodes={row.get('node_count')}, edges={row.get('edge_count')}{suffix}")
 
 
+def stage_visualization(kb: KB, cfg: Dict[str, Any]) -> None:
+    result = build_visualization_artifacts(kb, cfg)
+    kb.append_df("visualization_exports", result)
+    row = result.iloc[0].to_dict() if not result.empty else {}
+    details = str(row.get("details") or "")
+    suffix = f", details={details[:240]}" if details and row.get("status") != "ok" else ""
+    console.print(f"visualization: {row.get('status')}, path={row.get('output_path')}, nodes={row.get('node_count')}, edges={row.get('edge_count')}{suffix}")
+
+
 def stage_smoke(kb: KB, cfg: Dict[str, Any]) -> None:
     tables = [
         "repo_inventory",
@@ -1143,12 +1153,13 @@ STAGES: Dict[str, Callable[[KB, Dict[str, Any]], None]] = {
     "endpoint_map": stage_endpoint_map,
     "capabilities": stage_capabilities,
     "publish": stage_publish,
+    "visualization": stage_visualization,
     "smoke": stage_smoke,
 }
 
 FULL_ORDER = [
     "repo_ingest", "git_history", "git_blame", "code_graph", "code_index", "embeddings", "api_surface", "static_edges", "datadog", "bigquery",
-    "entity_resolution", "graph", "endpoint_map", "capabilities", "publish", "smoke",
+    "entity_resolution", "graph", "endpoint_map", "capabilities", "publish", "smoke", "visualization",
 ]
 
 STAGE_ALIASES = {
@@ -1168,6 +1179,8 @@ STAGE_ALIASES = {
     "endpoints": "endpoint_map",
     "endpoint-map": "endpoint_map",
     "capability": "capabilities",
+    "visual": "visualization",
+    "visualize": "visualization",
 }
 
 

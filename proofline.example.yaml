@@ -299,6 +299,9 @@ code_graph:
     max_edges: null
   max_repos: null
 
+visualization:
+  output_path: ./data/visualization/graph.json
+
 agent:
   # Legacy single-agent shape below still works. For multiple agents, set
   # active/fallback and add profiles under agents. Shared fields here are
