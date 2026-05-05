@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Iterator, List
 
 import pandas as pd
 
+from proofline.progress import progress_kwargs
 from proofline.utils import safe_read_text, stable_id, json_dumps
 
 LANG_BY_EXT = {
@@ -591,7 +592,7 @@ def iter_file_chunks(
         try:
             from tqdm.auto import tqdm
 
-            iterator = tqdm(iterator, total=len(repo_files), desc=desc or "REPO chunk files", unit="file", position=1, leave=False)
+            iterator = tqdm(iterator, **progress_kwargs(total=len(repo_files), desc=desc or "REPO chunk files", unit="file", position=1, leave=False))
         except Exception:
             pass
     for _, f in iterator:

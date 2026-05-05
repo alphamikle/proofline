@@ -14,3 +14,6 @@ pfl = "proofline.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["proofline*"]
+
+[tool.setuptools.package-data]
+proofline = ["ui/static/*", "ui/static/assets/*"]

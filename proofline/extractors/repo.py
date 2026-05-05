@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 import pandas as pd
 
+from proofline.progress import progress_kwargs
 from proofline.utils import now_iso, run_cmd, safe_read_text, stable_id, json_dumps
 
 EXT_LANG = {
@@ -162,7 +163,7 @@ def scan_repo(
             from tqdm.auto import tqdm
 
             path_list = list(paths)
-            paths = tqdm(path_list, total=len(path_list), desc=progress_desc, unit="file", position=progress_position, leave=False)
+            paths = tqdm(path_list, **progress_kwargs(total=len(path_list), desc=progress_desc, unit="file", position=progress_position, leave=False))
         except Exception:
             paths = iter_files(repo, exclude_dirs, max_file_mb)
     for path in paths:

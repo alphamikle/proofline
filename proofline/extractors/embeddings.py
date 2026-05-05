@@ -14,6 +14,7 @@ from urllib.parse import urljoin
 import pandas as pd
 import requests
 
+from proofline.progress import progress_kwargs
 from proofline.utils import now_iso
 
 AST_EMBEDDING_KINDS = {
@@ -642,12 +643,12 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     repo_ids = repos["repo_id"].fillna("").astype(str).tolist()
     global_bar = None
     if tqdm:
-        global_bar = tqdm(
+        global_bar = tqdm(**progress_kwargs(
             total=count_eligible_embedding_chunks(kb, cfg, repo_ids),
             desc=f"GLOBAL embeddings via {provider}",
             unit="chunk",
             position=0,
-        )
+        ))
 
     for repo_id in repo_ids:
         if not repo_id:
@@ -692,14 +693,14 @@ def build_code_embeddings(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
 
         index, existing_meta = load_existing_repo_index(faiss, index_path, meta_path, chunks, model_name) if not rebuild else (None, pd.DataFrame())
         if tqdm:
-            repo_bar = tqdm(
+            repo_bar = tqdm(**progress_kwargs(
                 total=len(chunks),
                 initial=len(existing_meta),
                 desc=f"REPO embeddings {repo_id}",
                 unit="chunk",
                 position=1,
                 leave=False,
-            )
+            ))
         if global_bar is not None and len(existing_meta):
             global_bar.update(len(existing_meta))
         if not existing_meta.empty and len(existing_meta) == len(chunks):
@@ -886,12 +887,12 @@ def build_code_embeddings_parallel(cfg: Dict[str, Any], repo_ids: List[str], wor
 
         kb = KB(cfg["storage"]["duckdb_path"])
         try:
-            global_bar = tqdm(
+            global_bar = tqdm(**progress_kwargs(
                 total=count_eligible_embedding_chunks(kb, cfg, repo_ids),
                 desc="GLOBAL embeddings",
                 unit="chunk",
                 position=0,
-            )
+            ))
         finally:
             kb.close()
 
@@ -908,7 +909,7 @@ def build_code_embeddings_parallel(cfg: Dict[str, Any], repo_ids: List[str], wor
         iterator = as_completed(futures)
         repo_bar = None
         if tqdm:
-            repo_bar = tqdm(total=0, desc="REPO embeddings", unit="chunk", position=1, leave=False)
+            repo_bar = tqdm(**progress_kwargs(total=0, desc="REPO embeddings", unit="chunk", position=1, leave=False))
         try:
             for future in iterator:
                 result = future.result()

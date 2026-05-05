@@ -423,6 +423,26 @@ proofline visualize
 Use `proofline visualize --refresh` to rebuild the JSON before starting the
 local UI server. The default artifact is `data/visualization/graph.json`.
 
+## Local Control UI
+
+`pfl ui` starts a local React control panel for the Proofline pipeline:
+
+```bash
+pfl ui --config proofline.yaml
+```
+
+The UI lets you run individual stages, run a selected pipeline range, trigger
+sync/build/publish jobs, edit `proofline.yaml`, inspect table counts, and watch
+job logs/status. It binds to `127.0.0.1:8766` by default:
+
+```bash
+pfl ui --config proofline.yaml --host 127.0.0.1 --port 8766
+```
+
+Use `--no-browser` to start the server without opening a browser. Binding to a
+non-local host is possible, but the UI can edit config and start local pipeline
+jobs, so keep it on loopback unless you are protecting it at the network layer.
+
 ## LLM Answers
 
 By default, `agent.provider: none`, so Proofline generates deterministic markdown from graph facts.

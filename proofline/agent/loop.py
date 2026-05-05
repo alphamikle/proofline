@@ -239,14 +239,14 @@ def _finalize_from_trace(
         )
     except Exception as e:
         reporter.emit("tool_error", tool="finalize", error=str(e))
-        return {"answer": f"Не удалось получить финальный ответ от модели: {e}", "evidence": [], "unknowns": []}
+        return {"answer": f"Failed to get the final answer from the model: {e}", "evidence": [], "unknowns": []}
     parsed = _parse_json_response(raw or "")
     final = parsed.get("final") if isinstance(parsed, dict) else None
     if isinstance(final, dict):
         reporter.emit("final_start")
         return final
     return {
-        "answer": str(raw or "Не удалось получить финальный ответ от модели.").strip(),
+        "answer": str(raw or "Failed to get the final answer from the model.").strip(),
         "evidence": [],
         "unknowns": ["The model did not return the expected final JSON shape."],
     }

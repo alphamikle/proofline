@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List
 
 import pandas as pd
 import yaml
@@ -19,23 +19,32 @@ TOPIC_RE = re.compile(r"\b([a-z][a-z0-9_.\-]+\.(?:events?|commands?|topic|queue)
 INTERNAL_PACKAGE_RE = re.compile(r"(@[A-Za-z0-9_.\-/]+/[A-Za-z0-9_.\-/]+|com\.[A-Za-z0-9_.\-]+|[A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+)")
 
 
-def extract_static_edges(repo_inventory: pd.DataFrame, repo_files: pd.DataFrame) -> pd.DataFrame:
+def extract_static_edges(
+    repo_inventory: pd.DataFrame,
+    repo_files: pd.DataFrame,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
     edges: List[Dict[str, Any]] = []
     inv_by_repo = {r["repo_id"]: r for _, r in repo_inventory.iterrows()}
     for _, f in repo_files.iterrows():
-        repo_id = str(f["repo_id"])
-        from_entity = f"repo:{repo_id}"
-        rel = str(f["rel_path"])
-        path = Path(str(f["path"]))
-        text = safe_read_text(path)
-        if not text:
-            continue
-        kind = str(f.get("kind") or "")
-        if kind == "manifest":
-            edges.extend(parse_manifest(repo_id, from_entity, rel, text))
-        if kind in {"deploy_config", "source", "source_route_hint", "manifest", "dockerfile", "api_contract"}:
-            include_hosts = kind not in {"source", "source_route_hint"}
-            edges.extend(parse_refs(repo_id, from_entity, rel, text, include_hosts=include_hosts))
+        try:
+            repo_id = str(f["repo_id"])
+            from_entity = f"repo:{repo_id}"
+            rel = str(f["rel_path"])
+            path = Path(str(f["path"]))
+            text = safe_read_text(path)
+            if not text:
+                continue
+            kind = str(f.get("kind") or "")
+            if kind == "manifest":
+                edges.extend(parse_manifest(repo_id, from_entity, rel, text))
+            if kind in {"deploy_config", "source", "source_route_hint", "manifest", "dockerfile", "api_contract"}:
+                include_hosts = kind not in {"source", "source_route_hint"}
+                edges.extend(parse_refs(repo_id, from_entity, rel, text, include_hosts=include_hosts))
+        finally:
+            if progress_callback is not None:
+                progress_callback(1)
     return pd.DataFrame(edges)
 
 

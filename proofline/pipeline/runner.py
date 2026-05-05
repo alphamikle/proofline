@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,6 +9,7 @@ from threading import Lock
 
 import pandas as pd
 import typer
+from rich.table import Table
 
 from proofline.config import DEFAULT_CONFIG, load_config, ensure_dirs
 from proofline.logging_utils import setup_logging, log_step, console
@@ -38,6 +40,7 @@ from proofline.extractors.embeddings import build_code_embeddings
 from proofline.extractors.graph_backend import publish_graph_backend
 from proofline.extractors.code_graph import import_code_graph, run_code_graph_index
 from proofline.pipeline.repo_jobs import mark_repo_stage, max_workers, repo_stage_done
+from proofline.progress import progress_bar, progress_kwargs
 from proofline.visualization import build_visualization_artifacts
 
 app = typer.Typer(help="Proofline pipeline")
@@ -52,15 +55,56 @@ def stage_record(kb: KB, stage: str, started: str, status: str, details: str = "
     }]))
 
 
-def run_stage(name: str, cfg: Dict[str, Any], func: Callable[[KB, Dict[str, Any]], None]) -> None:
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    seconds = max(0, float(seconds))
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def _stage_bar(desc: str, total: int, *, unit: str = "step", position: int = 0, **kwargs: Any) -> Any:
+    return progress_bar(total=max(1, int(total)), desc=desc, unit=unit, position=position, **kwargs)
+
+
+def _advance_bar(bar: Any, n: int = 1) -> None:
+    if bar is not None:
+        bar.update(n)
+
+
+def _close_bar(bar: Any) -> None:
+    if bar is not None:
+        bar.close()
+
+
+def _complete_stage_bar(desc: str) -> None:
+    bar = _stage_bar(desc, 1)
+    try:
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
+
+
+def run_stage(name: str, cfg: Dict[str, Any], func: Callable[[KB, Dict[str, Any]], None]) -> dict[str, Any]:
+    started = now_iso()
+    started_perf = time.perf_counter()
+    console.print(f"stage {name}: started_at={started}", highlight=False)
     log_step(name)
     kb = KB(cfg["storage"]["duckdb_path"])
-    started = now_iso()
     try:
         func(kb, cfg)
+        elapsed = time.perf_counter() - started_perf
+        finished = now_iso()
         stage_record(kb, name, started, "ok", "")
+        console.print(f"stage {name}: finished status=ok elapsed={_format_duration(elapsed)}", highlight=False)
+        return {"started_at": started, "finished_at": finished, "elapsed_seconds": elapsed}
     except Exception as e:
+        elapsed = time.perf_counter() - started_perf
         stage_record(kb, name, started, "error", str(e))
+        console.print(f"stage {name}: finished status=error elapsed={_format_duration(elapsed)}", highlight=False)
         raise
     finally:
         kb.close()
@@ -111,6 +155,7 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
     except Exception:
         tqdm = None
 
+    repo_progress_bar = None
     global_bar = None
 
     def update_global_progress(n: int) -> None:
@@ -125,9 +170,13 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
             repo_path,
             cfg,
             progress_desc=progress_desc,
+            progress_position=2,
             progress_callback=update_global_progress if global_bar is not None else None,
         )
         return repo_id, fingerprint, inv, fs, own, hist
+
+    if tqdm:
+        repo_progress_bar = tqdm(**progress_kwargs(total=len(repos), desc="GLOBAL repo ingest", unit="repo", position=0))
 
     pending: list[Path] = []
     for repo in repos:
@@ -137,13 +186,15 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
             existing_files = kb.query_df("SELECT COUNT(*) AS n FROM repo_files WHERE repo_id = ?", [repo_id])
             file_count += int(existing_files.iloc[0]["n"]) if not existing_files.empty else 0
             skipped += 1
+            if repo_progress_bar is not None:
+                repo_progress_bar.update(1)
             continue
         mark_repo_stage(kb, "repo_ingest", repo_id, fingerprint, "running")
         pending.append(repo)
 
     pending_file_counts = {repo: _repo_ingest_file_count(repo, cfg) for repo in pending} if tqdm else {}
     if tqdm:
-        global_bar = tqdm(total=sum(pending_file_counts.values()), desc="GLOBAL repo ingest", unit="file", position=0)
+        global_bar = tqdm(**progress_kwargs(total=sum(pending_file_counts.values()), desc="GLOBAL repo files", unit="file", position=1))
 
     iterator: Any
     try:
@@ -153,7 +204,7 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
                 iterator = as_completed(futures)
                 repo_bar = None
                 if tqdm:
-                    repo_bar = tqdm(total=0, desc="REPO scan", unit="file", position=1, leave=False)
+                    repo_bar = tqdm(**progress_kwargs(total=0, desc="REPO scan", unit="file", position=2, leave=False))
                 try:
                     for future in iterator:
                         repo_id, fingerprint, inv, fs, own, hist = future.result()
@@ -165,6 +216,8 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
                             repo_bar.update(len(fs))
                         scanned += 1
                         file_count += len(fs)
+                        if repo_progress_bar is not None:
+                            repo_progress_bar.update(1)
                 finally:
                     if repo_bar is not None:
                         repo_bar.close()
@@ -176,9 +229,13 @@ def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
                 mark_repo_stage(kb, "repo_ingest", repo_id, fingerprint, "ok", item_count=len(fs))
                 scanned += 1
                 file_count += len(fs)
+                if repo_progress_bar is not None:
+                    repo_progress_bar.update(1)
     finally:
         if global_bar is not None:
             global_bar.close()
+        if repo_progress_bar is not None:
+            repo_progress_bar.close()
     console.print(f"repos: {len(repos)}, files: {file_count}, scanned={scanned}, skipped={skipped}")
 
 
@@ -217,6 +274,7 @@ def _repo_ingest_file_count(repo: Path, cfg: Dict[str, Any]) -> int:
 def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
     gh_cfg = dict(cfg.get("git_history") or {})
     if not gh_cfg.get("enabled", True):
+        _complete_stage_bar("GLOBAL git history")
         console.print("git history: disabled")
         return
     gh_cfg["current_blame"] = False
@@ -230,6 +288,7 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
     except Exception:
         tqdm = None
 
+    repo_progress_bar = tqdm(**progress_kwargs(total=len(repos), desc="REPO git history", unit="repo", position=1)) if tqdm else None
     global_bar = None
 
     def update_global_progress(n: int) -> None:
@@ -252,6 +311,7 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
             repo_id,
             local_cfg,
             progress_desc=progress_desc,
+            progress_position=2,
             progress_callback=update_global_progress if global_bar is not None else None,
             commits=commits,
         )
@@ -263,6 +323,8 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
         fingerprint = repo_fp(row)
         if repo_stage_done(kb, "git_history", repo_id, fingerprint):
             skipped += 1
+            if repo_progress_bar is not None:
+                repo_progress_bar.update(1)
             continue
         existing = kb.query_df("SELECT commit_sha FROM git_commits WHERE repo_id = ?", [repo_id])
         row["_existing_shas"] = existing["commit_sha"].fillna("").astype(str).tolist() if not existing.empty else []
@@ -275,12 +337,12 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
         pending.append(row)
 
     if tqdm:
-        global_bar = tqdm(
+        global_bar = tqdm(**progress_kwargs(
             total=sum(len(row.get("_commits") or []) for row in pending),
             desc="GLOBAL git history",
             unit="commit",
             position=0,
-        )
+        ))
 
     iterator: Any
     try:
@@ -290,7 +352,7 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
                 iterator = as_completed(futures)
                 repo_bar = None
                 if tqdm:
-                    repo_bar = tqdm(total=0, desc="REPO history", unit="commit", position=1, leave=False)
+                    repo_bar = tqdm(**progress_kwargs(total=0, desc="REPO history", unit="commit", position=2, leave=False))
                 try:
                     for future in iterator:
                         repo_id, fingerprint, rows = future.result()
@@ -301,6 +363,8 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
                             repo_bar.reset(total=commit_count)
                             repo_bar.set_description(f"REPO history {repo_id}")
                             repo_bar.update(commit_count)
+                        if repo_progress_bar is not None:
+                            repo_progress_bar.update(1)
                         for key in totals:
                             totals[key] += counts.get(key, 0)
                 finally:
@@ -312,11 +376,15 @@ def stage_git_history(kb: KB, cfg: Dict[str, Any]) -> None:
                 repo_id, fingerprint, rows = build_one(row)
                 counts = _append_repo_git_history(kb, repo_id, rows)
                 mark_repo_stage(kb, "git_history", repo_id, fingerprint, "ok", item_count=counts.get("git_commits", 0))
+                if repo_progress_bar is not None:
+                    repo_progress_bar.update(1)
                 for key in totals:
                     totals[key] += counts.get(key, 0)
     finally:
         if global_bar is not None:
             global_bar.close()
+        if repo_progress_bar is not None:
+            repo_progress_bar.close()
 
     console.print(
         "git history: "
@@ -363,6 +431,7 @@ def _git_blame_file_count(repo: Path, gh_cfg: Dict[str, Any]) -> int:
 def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
     gh_cfg = dict(cfg.get("git_history") or {})
     if not gh_cfg.get("enabled", True) or not gh_cfg.get("current_blame", True):
+        _complete_stage_bar("GLOBAL git blame")
         console.print("git blame: disabled")
         return
     repos = kb.query_df("SELECT repo_id, repo_path, commit_sha FROM repo_inventory ORDER BY repo_id")
@@ -373,12 +442,15 @@ def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
     except Exception:
         tqdm = None
 
+    repo_progress_bar = tqdm(**progress_kwargs(total=len(repos), desc="REPO git blame", unit="repo", position=1)) if tqdm else None
     pending = []
     for row in repos.to_dict("records"):
         repo_id = str(row.get("repo_id") or "")
         fingerprint = str(row.get("commit_sha") or "") + ":blame"
         if repo_stage_done(kb, "git_blame", repo_id, fingerprint):
             skipped += 1
+            if repo_progress_bar is not None:
+                repo_progress_bar.update(1)
             continue
         started = now_iso()
         row["_fingerprint"] = fingerprint
@@ -388,12 +460,12 @@ def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
 
     global_bar = None
     if tqdm:
-        global_bar = tqdm(
+        global_bar = tqdm(**progress_kwargs(
             total=sum(_git_blame_file_count(Path(str(row.get("repo_path") or "")), gh_cfg) for row in pending),
             desc="GLOBAL git blame",
             unit="file",
             position=0,
-        )
+        ))
 
     def update_global_progress(n: int) -> None:
         if global_bar is not None:
@@ -410,6 +482,7 @@ def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
                     repo_id,
                     gh_cfg,
                     progress_desc=f"REPO blame {repo_id}",
+                    progress_position=2,
                     progress_callback=update_global_progress if global_bar is not None else None,
                 ).get("git_blame_current", [])
                 kb.execute("DELETE FROM git_blame_current WHERE repo_id = ?", [repo_id])
@@ -417,12 +490,16 @@ def stage_git_blame(kb: KB, cfg: Dict[str, Any]) -> None:
                     kb.append_df("git_blame_current", pd.DataFrame(rows))
                 rows_total += len(rows)
                 mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "ok", started_at=started, item_count=len(rows))
+                if repo_progress_bar is not None:
+                    repo_progress_bar.update(1)
             except Exception as e:
                 mark_repo_stage(kb, "git_blame", repo_id, fingerprint, "error", started_at=started, details=str(e))
                 raise
     finally:
         if global_bar is not None:
             global_bar.close()
+        if repo_progress_bar is not None:
+            repo_progress_bar.close()
     console.print(f"git blame: rows={rows_total}, skipped={skipped}")
 
 
@@ -455,7 +532,7 @@ def _stage_code_index_serial(kb: KB, cfg: Dict[str, Any]) -> None:
         for repo_id in iterator:
             if repo_id:
                 repo_file_counts[repo_id] = int(kb.query_df("SELECT COUNT(*) AS n FROM repo_files WHERE repo_id = ?", [repo_id]).iloc[0]["n"])
-        global_bar = tqdm(total=sum(repo_file_counts.values()), desc="GLOBAL code index", unit="file", position=0)
+        global_bar = tqdm(**progress_kwargs(total=sum(repo_file_counts.values()), desc="GLOBAL code index", unit="file", position=0))
 
     try:
         for repo_id in iterator:
@@ -538,7 +615,7 @@ def _stage_code_index_serial(kb: KB, cfg: Dict[str, Any]) -> None:
                         }
                         file_iterator = as_completed(future_rows)
                         if tqdm:
-                            file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                            file_iterator = tqdm(file_iterator, **progress_kwargs(total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False))
                         for future in file_iterator:
                             row = future_rows[future]
                             chunks = future.result()
@@ -548,7 +625,7 @@ def _stage_code_index_serial(kb: KB, cfg: Dict[str, Any]) -> None:
                 else:
                     file_iterator = changed_files
                     if tqdm:
-                        file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                        file_iterator = tqdm(file_iterator, **progress_kwargs(total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False))
                     for row in file_iterator:
                         rel_path = str(row.get("rel_path") or "")
                         chunks = chunks_for_file(row, cfg, graph_by_path.get(rel_path, []))
@@ -809,7 +886,7 @@ def _index_code_repo(
                     try:
                         from tqdm.auto import tqdm
 
-                        file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                        file_iterator = tqdm(file_iterator, **progress_kwargs(total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False))
                     except Exception:
                         pass
                 for future in file_iterator:
@@ -836,7 +913,7 @@ def _index_code_repo(
                 try:
                     from tqdm.auto import tqdm
 
-                    file_iterator = tqdm(file_iterator, total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False)
+                    file_iterator = tqdm(file_iterator, **progress_kwargs(total=len(changed_files), desc=f"REPO chunk {repo_id}", unit="file", position=1, leave=False))
                 except Exception:
                     pass
             for row in file_iterator:
@@ -869,6 +946,7 @@ def _index_code_repo(
 def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
     repos = kb.query_df("SELECT repo_id FROM repo_inventory ORDER BY repo_id")
     if repos.empty:
+        _complete_stage_bar("GLOBAL code index")
         console.print("chunks: no repositories")
         return
 
@@ -890,7 +968,7 @@ def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
     total_chunks = 0
     skipped = 0
     progress_lock = Lock()
-    global_bar = tqdm(total=0, desc="GLOBAL code index", unit="file", position=0) if tqdm else None
+    global_bar = tqdm(**progress_kwargs(total=0, desc="GLOBAL code index", unit="file", position=0)) if tqdm else None
 
     def add_global_total(n: int) -> None:
         if global_bar is None or n <= 0:
@@ -930,7 +1008,7 @@ def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
                 futures = [pool.submit(index_one, repo_id) for repo_id in repo_ids]
                 repo_iterator: Any = as_completed(futures)
                 if tqdm:
-                    repo_iterator = tqdm(repo_iterator, total=len(futures), desc="GLOBAL code repos", unit="repo", position=1, leave=False)
+                    repo_iterator = tqdm(repo_iterator, **progress_kwargs(total=len(futures), desc="REPO code index", unit="repo", position=1, leave=False))
                 for future in repo_iterator:
                     result = future.result()
                     total_chunks += int(result.get("chunk_count") or 0)
@@ -959,6 +1037,14 @@ def stage_code_index(kb: KB, cfg: Dict[str, Any]) -> None:
 
 
 def stage_embeddings(kb: KB, cfg: Dict[str, Any]) -> None:
+    emb = cfg.get("indexing", {}).get("embeddings", {})
+    if not emb.get("enabled", False):
+        _complete_stage_bar("GLOBAL embeddings")
+    else:
+        repos = kb.query_df("SELECT repo_id FROM repo_inventory LIMIT 1")
+        chunks = kb.query_df("SELECT repo_id FROM code_chunks LIMIT 1")
+        if repos.empty and chunks.empty:
+            _complete_stage_bar("GLOBAL embeddings")
     meta, details = build_code_embeddings(kb, cfg)
     if not meta.empty:
         kb.replace_df("code_embedding_index", meta)
@@ -968,39 +1054,84 @@ def stage_embeddings(kb: KB, cfg: Dict[str, Any]) -> None:
 def stage_api_surface(kb: KB, cfg: Dict[str, Any]) -> None:
     inv = kb.query_df("SELECT * FROM repo_inventory")
     files = kb.query_df("SELECT * FROM repo_files")
-    contracts, endpoints1 = parse_api_specs(inv, files)
-    endpoints2 = extract_static_routes(inv, files)
-    endpoints = pd.concat([endpoints1, endpoints2], ignore_index=True) if not endpoints1.empty or not endpoints2.empty else pd.DataFrame()
-    kb.replace_df("api_contracts", contracts)
-    kb.replace_df("api_endpoints", endpoints)
+    repo_ids = sorted({
+        *([str(x) for x in inv["repo_id"].dropna().astype(str).tolist()] if not inv.empty and "repo_id" in inv.columns else []),
+        *([str(x) for x in files["repo_id"].dropna().astype(str).tolist()] if not files.empty and "repo_id" in files.columns else []),
+    })
+    bar = _stage_bar("GLOBAL api surface", (len(repo_ids) if repo_ids else 1) + 2, unit="step")
+    contract_parts: list[pd.DataFrame] = []
+    endpoint_parts: list[pd.DataFrame] = []
+    try:
+        if repo_ids:
+            for repo_id in repo_ids:
+                repo_bar = _stage_bar(f"REPO api surface {repo_id}", 2, unit="step", position=1, leave=False)
+                try:
+                    repo_inv = inv[inv["repo_id"].fillna("").astype(str) == repo_id] if not inv.empty and "repo_id" in inv.columns else pd.DataFrame()
+                    repo_files = files[files["repo_id"].fillna("").astype(str) == repo_id] if not files.empty and "repo_id" in files.columns else pd.DataFrame()
+                    contracts_part, endpoints_part = parse_api_specs(repo_inv, repo_files)
+                    if not contracts_part.empty:
+                        contract_parts.append(contracts_part)
+                    if not endpoints_part.empty:
+                        endpoint_parts.append(endpoints_part)
+                    _advance_bar(repo_bar)
+                    routes_part = extract_static_routes(repo_inv, repo_files)
+                    if not routes_part.empty:
+                        endpoint_parts.append(routes_part)
+                    _advance_bar(repo_bar)
+                finally:
+                    _close_bar(repo_bar)
+                _advance_bar(bar)
+        else:
+            _advance_bar(bar)
+        contracts = pd.concat(contract_parts, ignore_index=True) if contract_parts else pd.DataFrame()
+        endpoints1 = pd.concat(endpoint_parts, ignore_index=True) if endpoint_parts else pd.DataFrame()
+        endpoints2 = pd.DataFrame()
+        endpoints = pd.concat([endpoints1, endpoints2], ignore_index=True) if not endpoints1.empty or not endpoints2.empty else pd.DataFrame()
+        kb.replace_df("api_contracts", contracts)
+        _advance_bar(bar)
+        kb.replace_df("api_endpoints", endpoints)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"contracts: {len(contracts)}, endpoints: {len(endpoints)}")
 
 
 def stage_code_graph(kb: KB, cfg: Dict[str, Any]) -> None:
     cg_cfg = cfg.get("code_graph", {})
     if not cg_cfg.get("enabled", False):
+        _complete_stage_bar("GLOBAL code graph")
         console.print("code graph: disabled")
         return
-    if cg_cfg.get("clear_existing", True):
-        kb.execute("DELETE FROM code_graph_runs")
-        kb.execute("DELETE FROM code_graph_symbols")
-        kb.execute("DELETE FROM code_graph_edges")
+    bar = _stage_bar("GLOBAL code graph stage", 6)
     try:
-        runs = run_code_graph_index(kb, cfg)
-    except Exception as e:
-        console.print(f"[yellow]code graph index failed; continuing without graph symbols: {e}[/yellow]")
-        runs = pd.DataFrame()
-    statuses = {str(s) for s in runs["status"].fillna("").tolist()} if not runs.empty and "status" in runs.columns else set()
-    try:
-        if runs.empty or statuses.isdisjoint({"ok", "cached"}):
+        if cg_cfg.get("clear_existing", True):
+            kb.execute("DELETE FROM code_graph_runs")
+            kb.execute("DELETE FROM code_graph_symbols")
+            kb.execute("DELETE FROM code_graph_edges")
+        _advance_bar(bar)
+        try:
+            runs = run_code_graph_index(kb, cfg)
+        except Exception as e:
+            console.print(f"[yellow]code graph index failed; continuing without graph symbols: {e}[/yellow]")
+            runs = pd.DataFrame()
+        _advance_bar(bar)
+        statuses = {str(s) for s in runs["status"].fillna("").tolist()} if not runs.empty and "status" in runs.columns else set()
+        _advance_bar(bar)
+        try:
+            if runs.empty or statuses.isdisjoint({"ok", "cached"}):
+                symbols, edges = pd.DataFrame(), pd.DataFrame()
+            else:
+                symbols, edges = import_code_graph(kb, cfg)
+        except Exception as e:
+            console.print(f"[yellow]code graph import failed; continuing without graph symbols: {e}[/yellow]")
             symbols, edges = pd.DataFrame(), pd.DataFrame()
-        else:
-            symbols, edges = import_code_graph(kb, cfg)
-    except Exception as e:
-        console.print(f"[yellow]code graph import failed; continuing without graph symbols: {e}[/yellow]")
-        symbols, edges = pd.DataFrame(), pd.DataFrame()
-    kb.replace_df("code_graph_symbols", symbols)
-    kb.replace_df("code_graph_edges", edges)
+        _advance_bar(bar)
+        kb.replace_df("code_graph_symbols", symbols)
+        _advance_bar(bar)
+        kb.replace_df("code_graph_edges", edges)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     counts = runs["status"].value_counts().to_dict() if not runs.empty else {}
     console.print(f"code graph runs: {counts}, symbols: {len(symbols)}, edges: {len(edges)}")
 
@@ -1008,97 +1139,239 @@ def stage_code_graph(kb: KB, cfg: Dict[str, Any]) -> None:
 def stage_static_edges(kb: KB, cfg: Dict[str, Any]) -> None:
     inv = kb.query_df("SELECT * FROM repo_inventory")
     files = kb.query_df("SELECT * FROM repo_files")
-    edges = extract_static_edges(inv, files)
-    kb.replace_df("static_edges", edges)
+    repo_ids = sorted([str(x) for x in files["repo_id"].dropna().astype(str).unique().tolist()]) if not files.empty and "repo_id" in files.columns else []
+    bar = _stage_bar("GLOBAL static edges", len(files) + 1, unit="file")
+    parts: list[pd.DataFrame] = []
+    try:
+        if repo_ids:
+            for repo_id in repo_ids:
+                repo_inv = inv[inv["repo_id"].fillna("").astype(str) == repo_id] if not inv.empty and "repo_id" in inv.columns else pd.DataFrame()
+                repo_files = files[files["repo_id"].fillna("").astype(str) == repo_id]
+                repo_bar = _stage_bar(f"REPO static edges {repo_id}", len(repo_files), unit="file", position=1, leave=False)
+
+                def update_repo_progress(n: int) -> None:
+                    _advance_bar(repo_bar, n)
+                    _advance_bar(bar, n)
+
+                try:
+                    part = extract_static_edges(repo_inv, repo_files, progress_callback=update_repo_progress)
+                    if not part.empty:
+                        parts.append(part)
+                finally:
+                    _close_bar(repo_bar)
+        edges = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        kb.replace_df("static_edges", edges)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"static edges: {len(edges)}")
 
 
 def stage_datadog(kb: KB, cfg: Dict[str, Any]) -> None:
-    services, dd_edges = pull_service_dependencies(cfg)
-    svc_defs = pull_service_definitions(cfg)
-    if not svc_defs.empty:
-        services = pd.concat([services, svc_defs], ignore_index=True) if not services.empty else svc_defs
-    spans = search_spans(cfg)
-    logs = search_logs(cfg)
-    runtime_svc, runtime_ep = build_runtime_edges_from_dd(spans, logs, dd_edges, cfg.get("datadog", {}).get("windows_days", [30]))
-    kb.replace_df("datadog_services", services)
-    kb.replace_df("datadog_service_edges", dd_edges)
-    kb.replace_df("datadog_spans", spans)
-    kb.replace_df("datadog_logs", logs)
-    kb.replace_df("runtime_service_edges", runtime_svc)
-    kb.replace_df("runtime_endpoint_edges", runtime_ep)
+    bar = _stage_bar("GLOBAL datadog", 10)
+    try:
+        services, dd_edges = pull_service_dependencies(cfg)
+        _advance_bar(bar)
+        svc_defs = pull_service_definitions(cfg)
+        _advance_bar(bar)
+        if not svc_defs.empty:
+            services = pd.concat([services, svc_defs], ignore_index=True) if not services.empty else svc_defs
+        _advance_bar(bar)
+        spans = search_spans(cfg)
+        _advance_bar(bar)
+        logs = search_logs(cfg)
+        _advance_bar(bar)
+        runtime_svc, runtime_ep = build_runtime_edges_from_dd(spans, logs, dd_edges, cfg.get("datadog", {}).get("windows_days", [30]))
+        _advance_bar(bar)
+        kb.replace_df("datadog_services", services)
+        _advance_bar(bar)
+        kb.replace_df("datadog_service_edges", dd_edges)
+        kb.replace_df("datadog_spans", spans)
+        kb.replace_df("datadog_logs", logs)
+        _advance_bar(bar)
+        kb.replace_df("runtime_service_edges", runtime_svc)
+        _advance_bar(bar)
+        kb.replace_df("runtime_endpoint_edges", runtime_ep)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"dd services rows: {len(services)}, dd service edges: {len(dd_edges)}, spans: {len(spans)}, logs: {len(logs)}, runtime edges: {len(runtime_svc)}, endpoint edges: {len(runtime_ep)}")
 
 
 def stage_bigquery(kb: KB, cfg: Dict[str, Any]) -> None:
-    jobs = pull_bq_jobs(cfg)
-    usage = build_table_usage(jobs)
-    kb.replace_df("bq_jobs", jobs)
-    kb.replace_df("bq_table_usage", usage)
+    bar = _stage_bar("GLOBAL bigquery", 4)
+    try:
+        jobs = pull_bq_jobs(cfg)
+        _advance_bar(bar)
+        usage = build_table_usage(jobs)
+        _advance_bar(bar)
+        kb.replace_df("bq_jobs", jobs)
+        _advance_bar(bar)
+        kb.replace_df("bq_table_usage", usage)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"bq jobs: {len(jobs)}, bq usage rows: {len(usage)}")
 
 
 def stage_entity_resolution(kb: KB, cfg: Dict[str, Any]) -> None:
-    inv = kb.query_df("SELECT * FROM repo_inventory")
-    dd_services = kb.query_df("SELECT * FROM datadog_services")
-    dd_edges = kb.query_df("SELECT * FROM datadog_service_edges")
-    own = kb.query_df("SELECT * FROM ownership")
-    api = kb.query_df("SELECT * FROM api_endpoints")
-    static = kb.query_df("SELECT * FROM static_edges")
-    bq = kb.query_df("SELECT * FROM bq_table_usage")
-    service_identity, aliases, unresolved = build_service_identity(inv, dd_services, dd_edges, own, api, static, bq)
-    kb.replace_df("service_identity", service_identity)
-    kb.replace_df("entity_aliases", aliases)
-    kb.replace_df("unresolved_entities", unresolved)
+    bar = _stage_bar("GLOBAL entity resolution", 11)
+    repo_bar = None
+    try:
+        inv = kb.query_df("SELECT * FROM repo_inventory")
+        repo_total = len(inv) if inv is not None and not inv.empty else 1
+        repo_bar = _stage_bar("REPO entity resolution", repo_total, unit="repo", position=1, leave=False)
+        _advance_bar(bar)
+        dd_services = kb.query_df("SELECT * FROM datadog_services")
+        _advance_bar(bar)
+        dd_edges = kb.query_df("SELECT * FROM datadog_service_edges")
+        _advance_bar(bar)
+        own = kb.query_df("SELECT * FROM ownership")
+        _advance_bar(bar)
+        api = kb.query_df("SELECT * FROM api_endpoints")
+        _advance_bar(bar)
+        static = kb.query_df("SELECT * FROM static_edges")
+        _advance_bar(bar)
+        bq = kb.query_df("SELECT * FROM bq_table_usage")
+        _advance_bar(bar)
+        service_identity, aliases, unresolved = build_service_identity(
+            inv,
+            dd_services,
+            dd_edges,
+            own,
+            api,
+            static,
+            bq,
+            progress_callback=lambda n: _advance_bar(repo_bar, n),
+        )
+        if inv is None or inv.empty:
+            _advance_bar(repo_bar)
+        _advance_bar(bar)
+        kb.replace_df("service_identity", service_identity)
+        _advance_bar(bar)
+        kb.replace_df("entity_aliases", aliases)
+        _advance_bar(bar)
+        kb.replace_df("unresolved_entities", unresolved)
+        _advance_bar(bar)
+    finally:
+        _close_bar(repo_bar)
+        _close_bar(bar)
     console.print(f"services: {len(service_identity)}, aliases: {len(aliases)}, unresolved: {len(unresolved)}")
 
 
 def stage_graph(kb: KB, cfg: Dict[str, Any]) -> None:
-    nodes, edges, evidence = build_graph(
-        kb.query_df("SELECT * FROM repo_inventory"),
-        kb.query_df("SELECT * FROM service_identity"),
-        kb.query_df("SELECT * FROM entity_aliases"),
-        kb.query_df("SELECT * FROM api_endpoints"),
-        kb.query_df("SELECT * FROM static_edges"),
-        kb.query_df("SELECT * FROM runtime_service_edges"),
-        kb.query_df("SELECT * FROM runtime_endpoint_edges"),
-        kb.query_df("SELECT * FROM bq_table_usage"),
-        kb.query_df("SELECT * FROM ownership"),
-        kb.query_df("SELECT * FROM code_graph_symbols"),
-        kb.query_df("SELECT * FROM code_graph_edges"),
-        kb.query_df("SELECT * FROM git_commits"),
-        kb.query_df("SELECT * FROM git_file_changes"),
-        kb.query_df("SELECT * FROM git_semantic_changes"),
-        kb.query_df("SELECT * FROM git_cochange_edges"),
-    )
-    kb.replace_df("nodes", nodes)
-    kb.replace_df("edges", edges)
-    kb.replace_df("evidence", evidence)
+    bar = _stage_bar("GLOBAL graph", 19)
+    try:
+        repo_inventory = kb.query_df("SELECT * FROM repo_inventory")
+        _advance_bar(bar)
+        service_identity = kb.query_df("SELECT * FROM service_identity")
+        _advance_bar(bar)
+        entity_aliases = kb.query_df("SELECT * FROM entity_aliases")
+        _advance_bar(bar)
+        api_endpoints = kb.query_df("SELECT * FROM api_endpoints")
+        _advance_bar(bar)
+        static_edges = kb.query_df("SELECT * FROM static_edges")
+        _advance_bar(bar)
+        runtime_service_edges = kb.query_df("SELECT * FROM runtime_service_edges")
+        _advance_bar(bar)
+        runtime_endpoint_edges = kb.query_df("SELECT * FROM runtime_endpoint_edges")
+        _advance_bar(bar)
+        bq_table_usage = kb.query_df("SELECT * FROM bq_table_usage")
+        _advance_bar(bar)
+        ownership = kb.query_df("SELECT * FROM ownership")
+        _advance_bar(bar)
+        code_graph_symbols = kb.query_df("SELECT * FROM code_graph_symbols")
+        _advance_bar(bar)
+        code_graph_edges = kb.query_df("SELECT * FROM code_graph_edges")
+        _advance_bar(bar)
+        git_commits = kb.query_df("SELECT * FROM git_commits")
+        _advance_bar(bar)
+        git_file_changes = kb.query_df("SELECT * FROM git_file_changes")
+        _advance_bar(bar)
+        git_semantic_changes = kb.query_df("SELECT * FROM git_semantic_changes")
+        _advance_bar(bar)
+        git_cochange_edges = kb.query_df("SELECT * FROM git_cochange_edges")
+        _advance_bar(bar)
+        nodes, edges, evidence = build_graph(
+            repo_inventory,
+            service_identity,
+            entity_aliases,
+            api_endpoints,
+            static_edges,
+            runtime_service_edges,
+            runtime_endpoint_edges,
+            bq_table_usage,
+            ownership,
+            code_graph_symbols,
+            code_graph_edges,
+            git_commits,
+            git_file_changes,
+            git_semantic_changes,
+            git_cochange_edges,
+        )
+        _advance_bar(bar)
+        kb.replace_df("nodes", nodes)
+        _advance_bar(bar)
+        kb.replace_df("edges", edges)
+        _advance_bar(bar)
+        kb.replace_df("evidence", evidence)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"nodes: {len(nodes)}, edges: {len(edges)}, evidence: {len(evidence)}")
 
 
 def stage_endpoint_map(kb: KB, cfg: Dict[str, Any]) -> None:
-    df = build_endpoint_dependency_map(
-        kb.query_df("SELECT * FROM api_endpoints"),
-        kb.query_df("SELECT * FROM runtime_endpoint_edges"),
-        kb.query_df("SELECT * FROM static_edges"),
-        kb.query_df("SELECT * FROM service_identity"),
-    )
-    kb.replace_df("endpoint_dependency_map", df)
+    bar = _stage_bar("GLOBAL endpoint map", 6)
+    try:
+        api_endpoints = kb.query_df("SELECT * FROM api_endpoints")
+        _advance_bar(bar)
+        runtime_endpoint_edges = kb.query_df("SELECT * FROM runtime_endpoint_edges")
+        _advance_bar(bar)
+        static_edges = kb.query_df("SELECT * FROM static_edges")
+        _advance_bar(bar)
+        service_identity = kb.query_df("SELECT * FROM service_identity")
+        _advance_bar(bar)
+        df = build_endpoint_dependency_map(api_endpoints, runtime_endpoint_edges, static_edges, service_identity)
+        _advance_bar(bar)
+        kb.replace_df("endpoint_dependency_map", df)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"endpoint dependency rows: {len(df)}")
 
 
 def stage_capabilities(kb: KB, cfg: Dict[str, Any]) -> None:
-    caps = build_capabilities(kb.query_df("SELECT * FROM api_endpoints"), kb.query_df("SELECT * FROM bq_table_usage"), kb.query_df("SELECT * FROM service_identity"))
-    kb.replace_df("data_capabilities", caps)
-    compat = build_compatibility_index(kb.query_df("SELECT * FROM api_endpoints"), kb.query_df("SELECT * FROM static_edges"), kb.query_df("SELECT * FROM runtime_service_edges"))
-    kb.replace_df("compatibility_index", compat)
+    bar = _stage_bar("GLOBAL capabilities", 7)
+    try:
+        api_endpoints = kb.query_df("SELECT * FROM api_endpoints")
+        _advance_bar(bar)
+        bq_table_usage = kb.query_df("SELECT * FROM bq_table_usage")
+        _advance_bar(bar)
+        service_identity = kb.query_df("SELECT * FROM service_identity")
+        _advance_bar(bar)
+        caps = build_capabilities(api_endpoints, bq_table_usage, service_identity)
+        _advance_bar(bar)
+        kb.replace_df("data_capabilities", caps)
+        _advance_bar(bar)
+        compat = build_compatibility_index(api_endpoints, kb.query_df("SELECT * FROM static_edges"), kb.query_df("SELECT * FROM runtime_service_edges"))
+        _advance_bar(bar)
+        kb.replace_df("compatibility_index", compat)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(f"capabilities: {len(caps)}, compatibility risk entities: {len(compat)}")
 
 
 def stage_publish(kb: KB, cfg: Dict[str, Any]) -> None:
-    result = publish_graph_backend(kb, cfg)
-    kb.append_df("graph_backend_exports", result)
+    bar = _stage_bar("GLOBAL publish", 2)
+    try:
+        result = publish_graph_backend(kb, cfg)
+        _advance_bar(bar)
+        kb.append_df("graph_backend_exports", result)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     row = result.iloc[0].to_dict() if not result.empty else {}
     details = str(row.get("details") or "")
     suffix = f", details={details[:240]}" if details and row.get("status") != "ok" else ""
@@ -1106,8 +1379,14 @@ def stage_publish(kb: KB, cfg: Dict[str, Any]) -> None:
 
 
 def stage_visualization(kb: KB, cfg: Dict[str, Any]) -> None:
-    result = build_visualization_artifacts(kb, cfg)
-    kb.append_df("visualization_exports", result)
+    bar = _stage_bar("GLOBAL visualization", 2)
+    try:
+        result = build_visualization_artifacts(kb, cfg)
+        _advance_bar(bar)
+        kb.append_df("visualization_exports", result)
+        _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     row = result.iloc[0].to_dict() if not result.empty else {}
     details = str(row.get("details") or "")
     suffix = f", details={details[:240]}" if details and row.get("status") != "ok" else ""
@@ -1131,9 +1410,14 @@ def stage_smoke(kb: KB, cfg: Dict[str, Any]) -> None:
         "data_capabilities",
     ]
     rows = []
-    for t in tables:
-        n = kb.query_df(f"SELECT COUNT(*) AS n FROM {t}").iloc[0]["n"]
-        rows.append({"table": t, "rows": int(n)})
+    bar = _stage_bar("GLOBAL smoke", len(tables), unit="table")
+    try:
+        for t in tables:
+            n = kb.query_df(f"SELECT COUNT(*) AS n FROM {t}").iloc[0]["n"]
+            rows.append({"table": t, "rows": int(n)})
+            _advance_bar(bar)
+    finally:
+        _close_bar(bar)
     console.print(pd.DataFrame(rows).to_string(index=False))
 
 
@@ -1189,6 +1473,91 @@ def resolve_stage(name: str) -> str:
     return STAGE_ALIASES.get(name.strip(), STAGE_ALIASES.get(normalized, normalized))
 
 
+def selected_order(
+    from_stage: Optional[str] = None,
+    to_stage: Optional[str] = None,
+) -> list[str]:
+    order = FULL_ORDER[:]
+    if from_stage:
+        start = resolve_stage(from_stage)
+        order = order[order.index(start):]
+    if to_stage:
+        end = resolve_stage(to_stage)
+        order = order[: order.index(end) + 1]
+    return order
+
+
+def print_pipeline_progress(
+    order: list[str],
+    statuses: Dict[str, str],
+    *,
+    stage_started_at: Dict[str, str] | None = None,
+    stage_elapsed: Dict[str, float] | None = None,
+    running_since: Dict[str, float] | None = None,
+) -> None:
+    table = Table(title="Pipeline stages", show_lines=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Stage")
+    table.add_column("Status")
+    table.add_column("Started")
+    table.add_column("Elapsed", justify="right")
+    table.add_column("Progress", justify="right")
+
+    status_styles = {
+        "pending": "dim",
+        "running": "cyan",
+        "ok": "green",
+        "error": "red",
+    }
+    progress_by_status = {
+        "pending": "0%",
+        "running": "0%",
+        "ok": "100%",
+        "error": "0%",
+    }
+    for idx, stage in enumerate(order, start=1):
+        status = statuses.get(stage, "pending")
+        style = status_styles.get(status, "")
+        elapsed = stage_elapsed.get(stage) if stage_elapsed else None
+        if elapsed is None and status == "running" and running_since and stage in running_since:
+            elapsed = time.perf_counter() - running_since[stage]
+        table.add_row(
+            str(idx),
+            stage,
+            f"[{style}]{status}[/{style}]" if style else status,
+            (stage_started_at or {}).get(stage, ""),
+            _format_duration(elapsed),
+            progress_by_status.get(status, "0%"),
+        )
+    console.print(table)
+
+
+def print_pipeline_timing_summary(
+    timings: list[dict[str, Any]],
+    *,
+    total_elapsed: float,
+) -> None:
+    table = Table(title="Pipeline timing", show_lines=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Stage")
+    table.add_column("Status")
+    table.add_column("Started")
+    table.add_column("Finished")
+    table.add_column("Elapsed", justify="right")
+    for idx, row in enumerate(timings, start=1):
+        table.add_row(
+            str(idx),
+            str(row.get("stage") or ""),
+            str(row.get("status") or ""),
+            str(row.get("started_at") or ""),
+            str(row.get("finished_at") or ""),
+            _format_duration(row.get("elapsed_seconds")),
+        )
+    table.add_section()
+    table.add_row("", "TOTAL", "", "", "", _format_duration(total_elapsed))
+    console.print(table)
+
+
 def run_order(
     config: str = DEFAULT_CONFIG,
     from_stage: Optional[str] = None,
@@ -1197,15 +1566,75 @@ def run_order(
     setup_logging()
     cfg = load_config(config)
     ensure_dirs(cfg)
-    order = FULL_ORDER[:]
-    if from_stage:
-        start = resolve_stage(from_stage)
-        order = order[order.index(start):]
-    if to_stage:
-        end = resolve_stage(to_stage)
-        order = order[: order.index(end) + 1]
-    for s in order:
-        run_stage(s, cfg, STAGES[s])
+    order = selected_order(from_stage, to_stage)
+    statuses = {stage: "pending" for stage in order}
+    stage_started_at: Dict[str, str] = {}
+    stage_elapsed: Dict[str, float] = {}
+    running_since: Dict[str, float] = {}
+    timings: list[dict[str, Any]] = []
+    pipeline_started_at = now_iso()
+    pipeline_started_perf = time.perf_counter()
+    console.print(f"pipeline: started_at={pipeline_started_at}", highlight=False)
+    if order:
+        statuses[order[0]] = "running"
+        stage_started_at[order[0]] = now_iso()
+        running_since[order[0]] = time.perf_counter()
+    print_pipeline_progress(
+        order,
+        statuses,
+        stage_started_at=stage_started_at,
+        stage_elapsed=stage_elapsed,
+        running_since=running_since,
+    )
+    for idx, s in enumerate(order):
+        try:
+            running_since[s] = time.perf_counter()
+            stage_started_at.setdefault(s, now_iso())
+            result = run_stage(s, cfg, STAGES[s])
+        except Exception:
+            elapsed = time.perf_counter() - running_since.get(s, pipeline_started_perf)
+            stage_elapsed[s] = elapsed
+            timings.append({
+                "stage": s,
+                "status": "error",
+                "started_at": stage_started_at.get(s, ""),
+                "finished_at": now_iso(),
+                "elapsed_seconds": elapsed,
+            })
+            statuses[s] = "error"
+            print_pipeline_progress(
+                order,
+                statuses,
+                stage_started_at=stage_started_at,
+                stage_elapsed=stage_elapsed,
+                running_since=running_since,
+            )
+            print_pipeline_timing_summary(timings, total_elapsed=time.perf_counter() - pipeline_started_perf)
+            raise
+        stage_elapsed[s] = float(result.get("elapsed_seconds") or 0)
+        stage_started_at[s] = str(result.get("started_at") or stage_started_at.get(s, ""))
+        timings.append({
+            "stage": s,
+            "status": "ok",
+            "started_at": result.get("started_at") or stage_started_at.get(s, ""),
+            "finished_at": result.get("finished_at") or now_iso(),
+            "elapsed_seconds": result.get("elapsed_seconds") or 0,
+        })
+        statuses[s] = "ok"
+        if idx + 1 < len(order):
+            statuses[order[idx + 1]] = "running"
+            stage_started_at[order[idx + 1]] = now_iso()
+            running_since[order[idx + 1]] = time.perf_counter()
+        print_pipeline_progress(
+            order,
+            statuses,
+            stage_started_at=stage_started_at,
+            stage_elapsed=stage_elapsed,
+            running_since=running_since,
+        )
+    total_elapsed = time.perf_counter() - pipeline_started_perf
+    console.print(f"pipeline: finished_at={now_iso()} elapsed={_format_duration(total_elapsed)}", highlight=False)
+    print_pipeline_timing_summary(timings, total_elapsed=total_elapsed)
 
 
 @app.command()

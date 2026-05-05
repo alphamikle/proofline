@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import pandas as pd
 
@@ -17,6 +17,8 @@ def build_service_identity(
     api_endpoints: pd.DataFrame,
     static_edges: pd.DataFrame,
     bq_usage: pd.DataFrame,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rows: List[Dict[str, Any]] = []
     aliases: List[Dict[str, Any]] = []
@@ -69,6 +71,8 @@ def build_service_identity(
             aliases.append({"canonical_id": f"service:{service_id}", "alias": dd, "alias_type": "datadog_service", "source": "datadog", "confidence": conf})
         else:
             unresolved.append({"entity": repo_id, "entity_type": "repo", "reason": "no_datadog_service_match", "confidence": conf})
+        if progress_callback is not None:
+            progress_callback(1)
     # Datadog-only services become service identities too.
     known_aliases = {str(a["alias"]).lower() for a in aliases}
     for dd in sorted(dd_names):

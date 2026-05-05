@@ -11,22 +11,108 @@ from typing import Any, Iterable, Optional
 # the OpenMP runtime can abort the process before Python can recover.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# Keep native math libraries from multiplying threads inside each Proofline
+# worker. Users can override any of these before launching the CLI.
+for _thread_env_var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env_var, "1")
+del _thread_env_var
+
 import typer
 import yaml
 
-from proofline.config import CONFIG_ENV_VAR, DEFAULT_CONFIG, config_followup_warnings, default_config, ensure_dirs, load_config, migrate_config_file
+from proofline.config import (
+    CONFIG_ENV_VAR,
+    DEFAULT_CONFIG,
+    config_followup_warnings,
+    config_shape_diff,
+    default_config,
+    ensure_dirs,
+    load_config,
+    upgrade_config_file,
+)
 from proofline.logging_utils import console, setup_logging
 from proofline.repair import run_repair
 from proofline.uninstall import run_uninstall, uninstall_plan
 from proofline.upgrade import DEFAULT_REF, DEFAULT_REPO, UpgradeError, run_upgrade
 from proofline.utils import json_dumps
-from proofline.version import version_info
+from proofline.version import update_check, version_info
 
 app = typer.Typer(help="Proofline CLI")
 
 
+@app.callback()
+def main(
+    ctx: typer.Context,
+    no_update_check: bool = typer.Option(False, "--no-update-check", help="Skip the Proofline update check."),
+) -> None:
+    if ctx.resilient_parsing or no_update_check:
+        return
+    if ctx.invoked_subcommand in {"upgrade", None}:
+        return
+    maybe_show_update_notice()
+
+
 def config_path(config: Optional[str]) -> str:
     return config or os.getenv(CONFIG_ENV_VAR) or DEFAULT_CONFIG
+
+
+def maybe_show_update_notice() -> None:
+    if os.getenv("PROOFLINE_NO_UPDATE_CHECK") or not sys.stderr.isatty():
+        return
+    info = update_check()
+    if not info.get("available") or not info.get("update_available"):
+        return
+    current = info.get("current_version") or "unknown"
+    latest = info.get("latest_version") or "unknown"
+    typer.echo(
+        "\nProofline: a new version is available "
+        f"({current} -> {latest}).",
+        err=True,
+    )
+    typer.echo(f"To download and install it, run: {info.get('command')}\n", err=True)
+
+
+def ensure_indexing_config_current(config: Optional[str]) -> None:
+    path = Path(config_path(config))
+    if not path.exists():
+        return
+    diff = config_shape_diff(path)
+    if not diff["needs_migration"]:
+        return
+    missing = diff["missing_paths"]
+    shown = ", ".join(missing[:10]) if missing else "config_version"
+    if len(missing) > 10:
+        shown += f" (+{len(missing) - 10} more)"
+    typer.echo(
+        "\nYou are using a newer Proofline version, but this project's config is outdated.",
+        err=True,
+    )
+    typer.echo(f"Config: {path}", err=True)
+    typer.echo(
+        f"Config version: {diff.get('current_version') or 'unknown'} -> {diff['target_version']}",
+        err=True,
+    )
+    typer.echo(f"Missing keys: {shown}", err=True)
+    if not sys.stdin.isatty():
+        typer.echo(
+            f"Run this interactively to migrate it: pfl init --migrate --config {path}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if not typer.confirm("Update the config now? The old file will be saved next to it.", default=True):
+        typer.echo(f"Stopped. You can migrate later with: pfl init --migrate --config {path}", err=True)
+        raise typer.Exit(1)
+    migrated, backup, _ = upgrade_config_file(path, use_agent=True, quiet=True)
+    typer.echo(f"Previous config saved as: {backup}", err=True)
+    typer.echo(f"New config written to: {path}\n", err=True)
+    for warning in config_followup_warnings(migrated):
+        typer.echo(f"Needs attention: {warning}", err=True)
 
 
 def load_runtime(config: Optional[str]) -> tuple[dict[str, Any], KB]:
@@ -40,6 +126,7 @@ def load_runtime(config: Optional[str]) -> tuple[dict[str, Any], KB]:
 def run_named_stage(name: str, config: Optional[str]) -> None:
     from proofline.pipeline.runner import STAGES, resolve_stage, run_stage
 
+    ensure_indexing_config_current(config)
     setup_logging()
     cfg = load_config(config_path(config))
     ensure_dirs(cfg)
@@ -112,10 +199,12 @@ def init(
     target = Path(config_path(config))
     if target.exists() and not force:
         if migrate:
-            cfg, added = migrate_config_file(target)
+            cfg, backup, added = upgrade_config_file(target, use_agent=True, quiet=True)
             ensure_dirs(load_config(target))
             if added:
                 console.print(f"[green]Updated[/green] {target} with {len(added)} missing config keys.")
+                if backup:
+                    console.print(f"Previous config saved as {backup}")
             else:
                 console.print(f"[green]Already up to date[/green] {target}")
             warnings = config_followup_warnings(cfg)
@@ -373,6 +462,7 @@ def run(
     """Run the main Proofline pipeline."""
     from proofline.pipeline.runner import run_order
 
+    ensure_indexing_config_current(config)
     run_order(config_path(config), from_stage, to_stage)
 
 
@@ -406,6 +496,7 @@ def sync(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Sync source facts such as repos, docs, runtime signals, or data metadata."""
+    ensure_indexing_config_current(config)
     selected = (source or "all").replace("-", "_")
     skip_disabled = selected in {"all", "docs"}
     if selected in {"all", "repos", "repo"}:
@@ -428,6 +519,7 @@ def build(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Build local indexes, entity resolution, graph, and capability maps."""
+    ensure_indexing_config_current(config)
     selected = (target or "all").replace("-", "_")
     groups = {
         "all": ["history", "blame", "code-graph", "code", "embeddings", "api", "static", "identity", "graph", "endpoints", "capabilities", "visualization"],
@@ -455,6 +547,7 @@ def build(
 @app.command()
 def publish(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
     """Publish the local graph into the configured external graph backend."""
+    ensure_indexing_config_current(config)
     run_named_stage("publish", config)
 
 
@@ -473,6 +566,25 @@ def visualize(
     cfg = load_config(config_path(config))
     ensure_dirs(cfg)
     serve_visualization(cfg, host=host, port=port, open_browser=not no_browser, rebuild=refresh)
+
+
+@app.command()
+def ui(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8766, "--port"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the browser automatically."),
+) -> None:
+    """Start the local Proofline control UI."""
+    from proofline.ui.server import serve_ui
+
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        typer.echo(
+            "Warning: Proofline UI can start local pipeline jobs and edit config. "
+            f"Binding to {host!r} may expose it beyond this machine.",
+            err=True,
+        )
+    serve_ui(config_path(config), host=host, port=port, open_browser=not no_browser)
 
 
 @app.command()

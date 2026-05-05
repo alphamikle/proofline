@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from proofline.config import CONFIG_SHAPE_VERSION, load_config, migrate_config_file
+from proofline.config import CONFIG_SHAPE_VERSION, config_shape_diff, load_config, migrate_config_file, upgrade_config_file
 
 
 class ConfigMigrationTests(unittest.TestCase):
@@ -60,6 +60,30 @@ class ConfigMigrationTests(unittest.TestCase):
             self.assertIsNone(cfg["git_history"]["max_commits_per_repo"])
             self.assertIn("duckdb_path", cfg["storage"])
             self.assertEqual(yaml.safe_load(path.read_text(encoding="utf-8"))["config_version"], CONFIG_SHAPE_VERSION)
+
+    def test_upgrade_config_file_backs_up_and_writes_full_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proofline.yaml"
+            path.write_text(
+                "config_version: 1\nworkspace: ./old-data\nrepos:\n  root: ./old-repos\nagent:\n  provider: none\n",
+                encoding="utf-8",
+            )
+
+            cfg, backup, missing = upgrade_config_file(path, use_agent=False, quiet=True)
+            written = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+            self.assertIsNotNone(backup)
+            self.assertTrue(backup.exists())
+            self.assertIn("config_version: 1", backup.read_text(encoding="utf-8"))
+            self.assertEqual(written["config_version"], CONFIG_SHAPE_VERSION)
+            self.assertEqual(written["workspace"], "./old-data")
+            self.assertEqual(written["repos"]["root"], "./old-repos")
+            self.assertIn("exclude_dirs", written["repos"])
+            self.assertIn("repos.exclude_dirs", missing)
+            self.assertEqual(cfg["repos"]["root"], "./old-repos")
+
+            diff = config_shape_diff(path)
+            self.assertFalse(diff["needs_migration"])
 
 
 if __name__ == "__main__":

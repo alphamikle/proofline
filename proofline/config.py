@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -50,6 +51,30 @@ def missing_paths(base: Dict[str, Any], override: Dict[str, Any], prefix: str = 
         if isinstance(value, dict) and isinstance(override.get(key), dict):
             paths.extend(missing_paths(value, override[key], path))
     return paths
+
+
+def config_shape_diff(path: str | Path) -> Dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {path}. Run `proofline init` or pass --config."
+        )
+    original_text = path.read_text(encoding="utf-8")
+    original = yaml.safe_load(original_text) or {}
+    defaults = default_config()
+    missing = missing_paths(defaults, original)
+    version_current = original.get("config_version") == CONFIG_SHAPE_VERSION
+    return {
+        "path": str(path),
+        "original_text": original_text,
+        "original": original,
+        "defaults": defaults,
+        "missing_paths": missing,
+        "version_current": version_current,
+        "current_version": original.get("config_version"),
+        "target_version": CONFIG_SHAPE_VERSION,
+        "needs_migration": bool(missing) or not version_current,
+    }
 
 
 def default_config() -> Dict[str, Any]:
@@ -102,13 +127,10 @@ def minimal_default_config() -> Dict[str, Any]:
 
 def migrate_config_file(path: str | Path, *, quiet: bool = False) -> Tuple[Dict[str, Any], List[str]]:
     path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Config file not found: {path}. Run `proofline init` or pass --config."
-        )
-    original_text = path.read_text(encoding="utf-8")
-    original = yaml.safe_load(original_text) or {}
-    defaults = default_config()
+    diff = config_shape_diff(path)
+    original_text = diff["original_text"]
+    original = diff["original"]
+    defaults = diff["defaults"]
     missing = missing_paths(defaults, original)
     added = [path for path in missing if "." not in path]
     merged = deep_merge(defaults, original)
@@ -127,6 +149,132 @@ def migrate_config_file(path: str | Path, *, quiet: bool = False) -> Tuple[Dict[
             if warnings:
                 print("Config follow-up: " + "; ".join(warnings[:4]), file=sys.stderr)
     return merged, added
+
+
+def upgrade_config_file(
+    path: str | Path,
+    *,
+    use_agent: bool = True,
+    quiet: bool = False,
+) -> Tuple[Dict[str, Any], Path | None, List[str]]:
+    """Write a full merged config, preserving the old file beside it."""
+    path = Path(path)
+    diff = config_shape_diff(path)
+    original = diff["original"]
+    defaults = diff["defaults"]
+    missing = list(diff["missing_paths"])
+    merged = deep_merge(defaults, original)
+    merged["config_version"] = CONFIG_SHAPE_VERSION
+
+    if not diff["needs_migration"]:
+        return merged, None, []
+
+    backup = backup_config_path(path)
+    backup.write_text(diff["original_text"], encoding="utf-8")
+
+    text = None
+    if use_agent:
+        text = agent_merged_config_text(diff["original_text"], defaults, merged, original)
+    if not text:
+        text = yaml.safe_dump(merged, sort_keys=False, allow_unicode=False)
+    path.write_text(text, encoding="utf-8")
+    if not quiet:
+        shown = ", ".join(missing[:12])
+        suffix = f" (+{len(missing) - 12} more)" if len(missing) > 12 else ""
+        print(f"Upgraded config in {path}: merged missing {shown}{suffix}", file=sys.stderr)
+        print(f"Previous config saved as {backup}", file=sys.stderr)
+        warnings = config_followup_warnings(merged)
+        if warnings:
+            print("Config follow-up: " + "; ".join(warnings[:4]), file=sys.stderr)
+    return merged, backup, missing
+
+
+def backup_config_path(path: str | Path) -> Path:
+    path = Path(path)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = path.with_name(f"{path.stem}_{stamp}_old{path.suffix or '.yaml'}")
+    counter = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_{stamp}_{counter}_old{path.suffix or '.yaml'}")
+        counter += 1
+    return candidate
+
+
+def agent_merged_config_text(
+    original_text: str,
+    defaults: Dict[str, Any],
+    merged: Dict[str, Any],
+    original: Dict[str, Any],
+) -> str | None:
+    agent_cfg = original.get("agent") if isinstance(original, dict) else None
+    if not isinstance(agent_cfg, dict):
+        return None
+    provider = str(agent_cfg.get("provider") or "").lower()
+    agents = agent_cfg.get("agents")
+    if provider in {"", "none"} and not agents:
+        return None
+    try:
+        from proofline.agent.providers import complete_with_agent
+    except Exception:
+        return None
+
+    system_prompt = (
+        "You merge Proofline YAML config files. Return only YAML, no markdown. "
+        "Preserve every existing user value exactly, add missing keys from the new template, "
+        "and keep the result valid YAML."
+    )
+    user_prompt = (
+        "OLD CONFIG:\n"
+        + original_text
+        + "\n\nNEW DEFAULT CONFIG YAML:\n"
+        + yaml.safe_dump(defaults, sort_keys=False, allow_unicode=False)
+        + "\n\nDETERMINISTIC MERGED CONFIG YAML:\n"
+        + yaml.safe_dump(merged, sort_keys=False, allow_unicode=False)
+    )
+    try:
+        bounded_agent_cfg = dict(agent_cfg)
+        try:
+            bounded_agent_cfg["request_timeout_seconds"] = min(int(agent_cfg.get("request_timeout_seconds") or 60), 60)
+        except Exception:
+            bounded_agent_cfg["request_timeout_seconds"] = 60
+        text = complete_with_agent(system_prompt, user_prompt, {"agent": bounded_agent_cfg})
+    except Exception:
+        return None
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        parsed = yaml.safe_load(text) or {}
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    parsed["config_version"] = CONFIG_SHAPE_VERSION
+    if not _preserves_existing_values(original, parsed):
+        return None
+    completed = deep_merge(merged, parsed)
+    completed["config_version"] = CONFIG_SHAPE_VERSION
+    return yaml.safe_dump(completed, sort_keys=False, allow_unicode=False)
+
+
+def _preserves_existing_values(original: Any, candidate: Any) -> bool:
+    if isinstance(original, dict):
+        if not isinstance(candidate, dict):
+            return False
+        for key, value in original.items():
+            if key not in candidate:
+                return False
+            if not _preserves_existing_values(value, candidate[key]):
+                return False
+        return True
+    return original == candidate
 
 
 def migrate_config_text(text: str, original: Dict[str, Any], merged: Dict[str, Any]) -> str:

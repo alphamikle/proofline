@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 import pandas as pd
 from rich.console import Console
 
+from proofline.progress import progress_kwargs
 from proofline.utils import json_dumps, now_iso, stable_id
 
 console = Console()
@@ -47,37 +48,53 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
         from tqdm.auto import tqdm
     except Exception:
         tqdm = None
+
+    console.print(
+        "code graph: "
+        f"repos={len(repos)}, workers={max_workers}, timeout={timeout_seconds}s, retries={retries}",
+        highlight=False,
+    )
+
     pending = []
-    for _, repo in repos.reset_index(drop=True).iterrows():
-        repo_id = str(repo.get("repo_id") or "")
-        repo_path = str(repo.get("repo_path") or "")
-        command = os.path.expandvars(command_template.format(repo_id=shlex.quote(repo_id), repo_path=shlex.quote(repo_path)))
-        fingerprint = _code_graph_fingerprint(repo_id, repo_path, command)
-        existing = kb.query_df(
-            """
-            SELECT status, fingerprint
-            FROM pipeline_repo_status
-            WHERE stage = 'code_graph' AND repo_id = ?
-            LIMIT 1
-            """,
-            [repo_id],
-        )
-        if not existing.empty and str(existing.iloc[0].get("status") or "") == "ok" and str(existing.iloc[0].get("fingerprint") or "") == fingerprint:
-            rows.append({
-                "repo_id": repo_id,
-                "repo_path": repo_path,
-                "status": "cached",
-                "started_at": now_iso(),
-                "finished_at": now_iso(),
-                "command": command,
-                "details": "",
-            })
-            continue
-        pending.append((repo_id, repo_path, command, fingerprint))
+    prepare_bar = tqdm(**progress_kwargs(total=len(repos), desc="CODE GRAPH prepare", unit="repo", position=0)) if tqdm else None
+    try:
+        for _, repo in repos.reset_index(drop=True).iterrows():
+            repo_id = str(repo.get("repo_id") or "")
+            repo_path = str(repo.get("repo_path") or "")
+            command = os.path.expandvars(command_template.format(repo_id=shlex.quote(repo_id), repo_path=shlex.quote(repo_path)))
+            fingerprint = _code_graph_fingerprint(repo_id, repo_path, command)
+            existing = kb.query_df(
+                """
+                SELECT status, fingerprint
+                FROM pipeline_repo_status
+                WHERE stage = 'code_graph' AND repo_id = ?
+                LIMIT 1
+                """,
+                [repo_id],
+            )
+            if not existing.empty and str(existing.iloc[0].get("status") or "") == "ok" and str(existing.iloc[0].get("fingerprint") or "") == fingerprint:
+                rows.append({
+                    "repo_id": repo_id,
+                    "repo_path": repo_path,
+                    "status": "cached",
+                    "started_at": now_iso(),
+                    "finished_at": now_iso(),
+                    "command": command,
+                    "details": "",
+                })
+            else:
+                pending.append((repo_id, repo_path, command, fingerprint))
+            if prepare_bar is not None:
+                prepare_bar.update(1)
+    finally:
+        if prepare_bar is not None:
+            prepare_bar.close()
+
+    console.print(f"code graph: pending={len(pending)}, cached={len(rows)}", highlight=False)
 
     global_bar = None
     if tqdm:
-        global_bar = tqdm(total=len(pending) * (retries + 1), desc="GLOBAL code graph", unit="try", position=0)
+        global_bar = tqdm(**progress_kwargs(total=len(pending) * (retries + 1), desc="GLOBAL code graph", unit="try", position=0))
 
     def update_global_progress(n: int) -> None:
         if global_bar is not None:
@@ -94,7 +111,7 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
         try:
             attempts: Iterable[int] = range(retries + 1)
             if tqdm and max_workers == 1:
-                attempts = tqdm(attempts, total=retries + 1, desc=f"REPO code graph {repo_id}", unit="try", position=1, leave=False)
+                attempts = tqdm(attempts, **progress_kwargs(total=retries + 1, desc=f"REPO code graph {repo_id}", unit="try", position=1, leave=False))
             for attempt in attempts:
                 p = subprocess.run(
                     shlex.split(command),
@@ -139,7 +156,7 @@ def run_code_graph_index(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
                 iterator: Iterable[Any] = as_completed(futures)
                 repo_bar = None
                 if tqdm:
-                    repo_bar = tqdm(total=1, desc="REPO code graph", unit="repo", position=1, leave=False)
+                    repo_bar = tqdm(**progress_kwargs(total=1, desc="REPO code graph", unit="repo", position=1, leave=False))
                 try:
                     for future in iterator:
                         row = future.result()
@@ -212,18 +229,25 @@ def import_code_graph(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFra
     max_symbols = import_cfg.get("max_symbols")
     max_edges = import_cfg.get("max_edges")
     repo_index = _repo_index(kb.query_df("SELECT repo_id, repo_path FROM repo_inventory ORDER BY length(repo_path) DESC"))
+    node_types = import_cfg.get("node_types") or ["File", "Function", "Class", "Method", "Module", "Struct", "Enum", "Interface"]
+
+    console.print(
+        "code graph import: "
+        f"page_size={page_size}, query_timeout={timeout}s, node_types={len(node_types)}, edge_types={len(_edge_queries())}",
+        highlight=False,
+    )
 
     symbol_rows: dict[str, Dict[str, Any]] = {}
-    for node_type in import_cfg.get("node_types") or ["File", "Function", "Class", "Method", "Module", "Struct", "Enum", "Interface"]:
+    for node_type in node_types:
         query = _symbol_query(str(node_type))
-        for row in _paged_cgc_query(cgc, query, page_size, timeout, max_rows=max_symbols):
+        for row in _paged_cgc_query(cgc, query, page_size, timeout, max_rows=max_symbols, desc=f"CGC import {node_type}"):
             sym = _symbol_row(row, repo_index)
             if sym["symbol_id"]:
                 symbol_rows.setdefault(sym["symbol_id"], sym)
 
     edge_rows: dict[str, Dict[str, Any]] = {}
     for edge_type, query in _edge_queries().items():
-        for row in _paged_cgc_query(cgc, query, page_size, timeout, max_rows=max_edges):
+        for row in _paged_cgc_query(cgc, query, page_size, timeout, max_rows=max_edges, desc=f"CGC import {edge_type}"):
             src = _symbol_ref(row, "from", repo_index)
             dst = _symbol_ref(row, "to", repo_index)
             if src["symbol_id"]:
@@ -234,6 +258,7 @@ def import_code_graph(kb, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFra
             if edge["edge_id"]:
                 edge_rows.setdefault(edge["edge_id"], edge)
 
+    console.print(f"code graph import: symbols={len(symbol_rows)}, edges={len(edge_rows)}", highlight=False)
     return _symbol_df(symbol_rows.values()), _edge_df(edge_rows.values())
 
 
@@ -313,29 +338,52 @@ def _edge_queries() -> Dict[str, str]:
     }
 
 
-def _paged_cgc_query(cgc: str, base_query: str, page_size: int, timeout: int, max_rows: Any = None) -> Iterable[Dict[str, Any]]:
+def _paged_cgc_query(
+    cgc: str,
+    base_query: str,
+    page_size: int,
+    timeout: int,
+    max_rows: Any = None,
+    *,
+    desc: str = "CGC import",
+) -> Iterable[Dict[str, Any]]:
     offset = 0
     yielded = 0
     max_n = int(max_rows) if max_rows not in (None, "", 0) else None
-    while True:
-        limit = page_size
-        if max_n is not None:
-            limit = min(limit, max_n - yielded)
-            if limit <= 0:
+    bar = None
+    try:
+        from tqdm.auto import tqdm
+
+        bar = tqdm(**progress_kwargs(total=max_n, desc=desc, unit="row", leave=False))
+    except Exception:
+        console.print(f"{desc}: page_size={page_size}", highlight=False)
+    try:
+        while True:
+            limit = page_size
+            if max_n is not None:
+                limit = min(limit, max_n - yielded)
+                if limit <= 0:
+                    break
+            query = f"{base_query} SKIP {offset} LIMIT {limit}"
+            rows = _run_cgc_query(cgc, query, timeout)
+            if not rows:
                 break
-        query = f"{base_query} SKIP {offset} LIMIT {limit}"
-        rows = _run_cgc_query(cgc, query, timeout)
-        if not rows:
-            break
-        for row in rows:
-            if isinstance(row, dict):
-                yield row
-                yielded += 1
-                if max_n is not None and yielded >= max_n:
-                    return
-        if len(rows) < limit:
-            break
-        offset += limit
+            if bar is not None:
+                bar.update(len(rows))
+            else:
+                console.print(f"{desc}: offset={offset}, rows={len(rows)}", highlight=False)
+            for row in rows:
+                if isinstance(row, dict):
+                    yield row
+                    yielded += 1
+                    if max_n is not None and yielded >= max_n:
+                        return
+            if len(rows) < limit:
+                break
+            offset += limit
+    finally:
+        if bar is not None:
+            bar.close()
 
 
 def _run_cgc_query(cgc: str, query: str, timeout: int) -> List[Dict[str, Any]]:

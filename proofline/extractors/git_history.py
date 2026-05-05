@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 from proofline.extractors.repo import detect_kind, find_git_repos, repo_id_from_path
+from proofline.progress import progress_kwargs
 from proofline.utils import json_dumps, normalize_name, now_iso, run_cmd, stable_id
 
 JIRA_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
@@ -66,7 +67,7 @@ def extract_repo_git_history(
         try:
             from tqdm.auto import tqdm
 
-            commit_iter = tqdm(commits, total=len(commits), desc=progress_desc, unit="commit", position=progress_position, leave=False)
+            commit_iter = tqdm(commits, **progress_kwargs(total=len(commits), desc=progress_desc, unit="commit", position=progress_position, leave=False))
         except Exception:
             commit_iter = commits
     for commit in commit_iter:
@@ -309,7 +310,7 @@ def extract_current_blame(
         try:
             from tqdm.auto import tqdm
 
-            iterator = tqdm(candidates, total=len(candidates), desc=progress_desc, unit="file", position=progress_position, leave=False)
+            iterator = tqdm(candidates, **progress_kwargs(total=len(candidates), desc=progress_desc, unit="file", position=progress_position, leave=False))
         except Exception:
             iterator = candidates
     for rel in iterator:
