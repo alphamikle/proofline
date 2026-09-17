@@ -481,6 +481,56 @@ def mcp_server(
 
 
 @app.command()
+def watch(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    once: bool = typer.Option(False, "--once", help="Reindex pending changes once and exit (no observer)."),
+    full_on_start: bool = typer.Option(False, "--full-on-start", help="Full single-repo index before watching."),
+    debounce: Optional[float] = typer.Option(None, "--debounce", help="Debounce seconds (overrides watch.debounce_seconds)."),
+    slow_lane_minutes: Optional[float] = typer.Option(None, "--slow-lane-minutes", help="Slow lane interval minutes."),
+    jsonl: bool = typer.Option(False, "--jsonl", help="Emit machine-readable JSONL events on stdout."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress human-readable progress output."),
+) -> None:
+    """Watch the current git repo (CWD) and reindex changed files live."""
+    from proofline.config import load_config
+    from proofline.watch import watch_defaults
+    from proofline.watch.loop import Watcher
+    import proofline.watch.loop as loop_mod
+
+    cfg_path = config_path(config)
+    try:
+        cfg = load_config(cfg_path, quiet=True)
+        if "watch" not in cfg:
+            cfg["watch"] = watch_defaults()
+            import yaml
+
+            disk = yaml.safe_load(Path(cfg_path).read_text(encoding="utf-8")) or {}
+            disk["watch"] = cfg["watch"]
+            Path(cfg_path).write_text(yaml.safe_dump(disk, sort_keys=False), encoding="utf-8")
+    except Exception:
+        pass
+    watcher = Watcher(cfg_path, once=once, full_on_start=full_on_start, jsonl=jsonl, quiet=quiet)
+    if debounce is None and slow_lane_minutes is None:
+        raise SystemExit(watcher.run())
+    real_load = load_config
+
+    def patched_load(path: str, *, quiet: bool = False):  # type: ignore[no-untyped-def]
+        loaded = real_load(path, quiet=quiet)
+        section = dict(loaded.get("watch", {}) or {})
+        if debounce is not None:
+            section["debounce_seconds"] = float(debounce)
+        if slow_lane_minutes is not None:
+            section["slow_lane_minutes"] = float(slow_lane_minutes)
+        loaded["watch"] = section
+        return loaded
+
+    loop_mod.load_config = patched_load  # type: ignore[attr-defined]
+    try:
+        raise SystemExit(watcher.run())
+    finally:
+        loop_mod.load_config = real_load  # type: ignore[attr-defined]
+
+
+@app.command()
 def stage(
     name: str = typer.Argument(...),
     config: Optional[str] = typer.Option(None, "--config", "-c"),

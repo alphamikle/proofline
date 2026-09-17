@@ -283,6 +283,15 @@ graph_backend:
   batch_size: 1000
   clear_existing: true
 
+watch:
+  # Scope: exactly one repo - the directory where `pfl watch` runs.
+  # Other indexed projects are never touched by the watch loop.
+  debounce_seconds: 2.0
+  slow_lane_minutes: 15.0
+  full_rebuild_minutes: 0.0  # 0 = disabled
+  fast_lane: [repo_ingest, code_index, embeddings, api_surface, static_edges]
+  slow_lane: [git_history, git_blame, entity_resolution, graph, endpoint_map, capabilities]
+
 code_graph:
   enabled: true
   command: "$HOME/.local/bin/cgc index {repo_path}"

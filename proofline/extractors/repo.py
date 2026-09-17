@@ -64,7 +64,14 @@ def file_sha1(path: Path) -> str:
         return ""
 
 
-def iter_files(repo: Path, exclude_dirs: Iterable[str], max_file_mb: float) -> Iterator[Path]:
+def iter_files(
+    repo: Path,
+    exclude_dirs: Iterable[str],
+    max_file_mb: float,
+    *,
+    include_untracked: bool = True,
+) -> Iterator[Path]:
+    """Yield indexed files: tracked + untracked (minus .gitignore-excluded)."""
     excludes = set(exclude_dirs)
     max_bytes = int(max_file_mb * 1024 * 1024)
     try:
@@ -72,6 +79,12 @@ def iter_files(repo: Path, exclude_dirs: Iterable[str], max_file_mb: float) -> I
     except Exception:
         tracked = ""
     if tracked:
+        if include_untracked:
+            try:
+                others = run_cmd(["git", "ls-files", "-z", "--others", "--exclude-standard"], cwd=repo, timeout=120)
+            except Exception:
+                others = ""
+            tracked = tracked + ("\0" if tracked and others else "") + (others or "")
         for rel in tracked.split("\0"):
             if not rel:
                 continue

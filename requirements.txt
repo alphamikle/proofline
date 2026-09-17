@@ -22,3 +22,4 @@ sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
 neo4j>=5.20.0
 mcp[cli]>=1.0.0
+watchdog>=4.0.0

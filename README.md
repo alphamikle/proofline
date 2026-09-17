@@ -155,7 +155,20 @@ proofline stage smoke
 proofline status
 pfl status
 pfl repair
+pfl watch --config ./proofline.yaml
 ```
+
+Watch one repo live (run inside that repo; other indexed projects are untouched):
+
+```bash
+cd /path/to/your-repo
+pfl watch --config /path/to/proofline.yaml         # live reindex on save
+pfl watch --full-on-start                          # index this repo first, then watch
+pfl watch --once                                   # one incremental pass, no observer
+```
+
+Fast lane per save: `repo_ingest, code_index (+FTS), embeddings (delta), api_surface, static_edges`. Slow lane on commit or every `watch.slow_lane_minutes` (default 15): `git_history, git_blame, entity_resolution, graph, endpoint_map, capabilities`. Tune via the `watch:` section in `proofline.yaml` (`--debounce`, `--slow-lane-minutes`, `--jsonl`).
+
 
 `proofline` and `pfl` are equivalent. `sync` updates source facts. `build` derives local indexes and graph structures. `publish` sends the graph to the configured external graph backend. `repair` recreates missing config directories, refreshes Python dependencies and CLI links, and runs the CGC/SCIP/Neo4j Docker bootstrap.
 
@@ -386,6 +399,15 @@ The default FastMCP HTTP endpoint is usually:
 
 ```text
 http://localhost:8000/mcp
+```
+
+## Watch Mode (live single-repo reindex)
+
+Run `pfl watch` inside the repo you want to track. Proofline observes only that repo via OS file events (watchdog) and reindexes changed files: chunks + FTS immediately, embeddings as a delta, git history/blame and derived graph tables on commit or every `watch.slow_lane_minutes`.
+
+```bash
+cd /path/to/your-repo
+pfl watch --config /path/to/proofline.yaml --full-on-start
 ```
 
 ## External Graph Backend
