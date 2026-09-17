@@ -70,6 +70,42 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(AGENT_MENU_ALIASES["codex"], "openai")
 
 
+class OwnStateTests(unittest.TestCase):
+    def test_effective_exclude_dirs_adds_proofline(self):
+        from proofline.extractors.repo import effective_exclude_dirs
+
+        self.assertIn(".proofline", effective_exclude_dirs({"repos": {"exclude_dirs": ["node_modules"]}}))
+        # No duplicates when already configured.
+        out = effective_exclude_dirs({"repos": {"exclude_dirs": [".proofline"]}})
+        self.assertEqual(out.count(".proofline"), 1)
+
+    def test_init_appends_gitignore_without_config(self):
+        import tempfile
+        from proofline.cli import ensure_own_gitignore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            gi = root / ".gitignore"
+            gi.write_text("*.log\n", encoding="utf-8")
+            target = root / "proofline.yaml"
+            target.write_text("x: 1\n", encoding="utf-8")
+            ensure_own_gitignore(target)
+            text = gi.read_text(encoding="utf-8")
+            self.assertIn(".proofline/", text)
+            self.assertIn("*.log", text)
+            self.assertNotIn("proofline.yaml", text)
+            # Idempotent: second run changes nothing.
+            ensure_own_gitignore(target)
+            self.assertEqual(gi.read_text(encoding="utf-8"), text)
+
+    def test_watch_ignores_proofline_dir(self):
+        from proofline.watch import should_ignore_path
+
+        self.assertTrue(should_ignore_path(".proofline/kb.duckdb", set()))
+        self.assertFalse(should_ignore_path("src/app.py", set()))
+
+
 class ScopeTests(unittest.TestCase):
     def test_project_slug(self):
         self.assertEqual(_project_slug(Path("/x/detax/proofline.yaml")), "detax")

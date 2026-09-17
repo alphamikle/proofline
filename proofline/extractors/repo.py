@@ -157,6 +157,18 @@ def classify_repo(files: List[Dict[str, Any]], languages: Counter) -> str:
     return "unknown"
 
 
+# Directories Proofline itself creates inside an indexed repo.
+# Always skipped during scans even if missing from exclude_dirs
+# (e.g. old configs): the workspace holds DuckDB/FAISS/SQLite state
+# that must never be indexed as source code.
+PROOFLINE_OWN_DIRS = frozenset({".proofline"})
+
+
+def effective_exclude_dirs(cfg: Dict[str, Any] | None) -> list[str]:
+    configured = list((cfg or {}).get("repos", {}).get("exclude_dirs", []) or [])
+    return configured + [d for d in PROOFLINE_OWN_DIRS if d not in configured]
+
+
 def scan_repo(
     repo: Path,
     cfg: Dict[str, Any],
@@ -166,7 +178,7 @@ def scan_repo(
     progress_callback: Optional[Callable[[int], None]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     repo_id = repo_id_from_path(repo)
-    exclude_dirs = cfg["repos"].get("exclude_dirs", [])
+    exclude_dirs = effective_exclude_dirs(cfg)
     max_file_mb = float(cfg["repos"].get("max_file_mb", 2))
     files: List[Dict[str, Any]] = []
     language_counts: Counter = Counter()
@@ -295,7 +307,7 @@ def extract_git_history(repo: Path, repo_id: str, limit: int = 200) -> List[Dict
 
 def scan_all_repos(cfg: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     root = Path(cfg["repos"]["root"])
-    repos = find_git_repos(root, cfg["repos"].get("exclude_dirs", []))
+    repos = find_git_repos(root, effective_exclude_dirs(cfg))
     inventories: List[Dict[str, Any]] = []
     files: List[Dict[str, Any]] = []
     ownership: List[Dict[str, Any]] = []

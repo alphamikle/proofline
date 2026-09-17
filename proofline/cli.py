@@ -222,6 +222,7 @@ def init(
     with target.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=False)
     cfg = load_config(target)
+    ensure_own_gitignore(target)
     if interactive_run and cfg.get("graph_backend", {}).get("enabled") and cfg.get("graph_backend", {}).get("auto_install"):
         console.print("\n[bold]Provisioning Neo4j and dependencies...[/bold]")
         try:
@@ -329,6 +330,45 @@ def _is_git_repo(path: Path) -> bool:
         if parent == current:
             return False
         current = parent
+
+
+# Entries Proofline creates inside an indexed repo (besides the config).
+# `pfl init` appends them to the repo's .gitignore so own state is never
+# committed. The config file itself is intentionally NOT listed: whether
+# proofline.yaml is committed is the user's choice.
+OWN_GITIGNORE_ENTRIES = [".proofline/"]
+
+
+def ensure_own_gitignore(target: Path) -> None:
+    """Append Proofline state entries to the nearby .gitignore (if any)."""
+    try:
+        resolved = target.resolve()
+        current = resolved.parent
+        gitignore: Path | None = None
+        while True:
+            if (current / ".git").exists():
+                gitignore = current / ".gitignore"
+                break
+            parent = current.parent
+            if parent == current:
+                return
+            current = parent
+        assert gitignore is not None
+        existing: list[str] = []
+        if gitignore.exists():
+            existing = gitignore.read_text(encoding="utf-8").splitlines()
+        normalized = {line.strip() for line in existing}
+        missing = [e for e in OWN_GITIGNORE_ENTRIES if e not in normalized and e.rstrip("/") not in normalized]
+        if not missing:
+            return
+        with gitignore.open("a", encoding="utf-8") as f:
+            if existing and existing[-1].strip():
+                f.write("\n")
+            f.write("\n# Proofline own state (created by `pfl init`)\n")
+            for entry in missing:
+                f.write(f"{entry}\n")
+    except Exception:
+        pass
 
 
 def apply_git_history_preset(cfg: dict[str, Any], preset: str) -> None:

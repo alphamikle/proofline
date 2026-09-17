@@ -15,7 +15,7 @@ from proofline.config import DEFAULT_CONFIG, load_config, ensure_dirs
 from proofline.logging_utils import setup_logging, log_step, console
 from proofline.storage import KB
 from proofline.utils import now_iso
-from proofline.extractors.repo import find_git_repos, iter_files, repo_id_from_path, repo_source_fingerprint, scan_repo
+from proofline.extractors.repo import effective_exclude_dirs, find_git_repos, iter_files, repo_id_from_path, repo_source_fingerprint, scan_repo
 from proofline.extractors.git_history import build_cochange_edges, extract_commits, extract_repo_git_blame, extract_repo_git_history, should_index_blame
 from proofline.extractors.code_index import (
     ast_chunking_config,
@@ -139,7 +139,7 @@ def maybe_clone_repos(cfg: Dict[str, Any]) -> None:
 
 def stage_repo_ingest(kb: KB, cfg: Dict[str, Any]) -> None:
     maybe_clone_repos(cfg)
-    repos = find_git_repos(Path(cfg["repos"]["root"]), cfg["repos"].get("exclude_dirs", []))
+    repos = find_git_repos(Path(cfg["repos"]["root"]), effective_exclude_dirs(cfg))
     repo_ids = {repo_id_from_path(repo) for repo in repos}
     existing_repo_ids = kb.query_df("SELECT repo_id FROM repo_inventory")
     for old_repo_id in existing_repo_ids["repo_id"].fillna("").astype(str).tolist() if not existing_repo_ids.empty else []:
@@ -266,7 +266,7 @@ def _delete_repo_ingest_rows(kb: KB, repo_id: str) -> None:
 
 def _repo_ingest_file_count(repo: Path, cfg: Dict[str, Any]) -> int:
     try:
-        return sum(1 for _ in iter_files(repo, cfg["repos"].get("exclude_dirs", []), float(cfg["repos"].get("max_file_mb", 2))))
+        return sum(1 for _ in iter_files(repo, effective_exclude_dirs(cfg), float(cfg["repos"].get("max_file_mb", 2))))
     except Exception:
         return 0
 

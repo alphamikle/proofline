@@ -19,6 +19,8 @@ DEFAULT_FULL_REBUILD_MINUTES = 0.0
 
 DEFAULT_IGNORE_NAMES = {
     ".DS_Store", ".git", ".hg", ".svn", "__pycache__", ".idea", ".vscode",
+    # Proofline's own state dir (workspace ./.proofline) - never reindex it.
+    ".proofline",
 }
 
 DEFAULT_IGNORE_SUFFIXES = ("~", ".swp", ".swo", ".swn", ".tmp", ".temp", ".bak", ".orig", ".rej")
