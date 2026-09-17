@@ -132,13 +132,18 @@ def link_cli_binaries(*, bin_dir: Optional[str], dry_run: bool, steps: list[Repa
             missing.append(str(source))
             continue
         target_dir.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            if target.is_symlink():
-                target.unlink()
-            else:
-                backup = target.with_name(f"{target.name}.repair.{int(time.time())}.bak")
-                target.replace(backup)
-                backups.append(f"{target} -> {backup}")
+        if target.is_symlink():
+            try:
+                if Path(os.readlink(target)) == source:
+                    created.append(f"{target} already linked")
+                    continue
+            except OSError:
+                pass
+            target.unlink()
+        elif target.exists():
+            backup = target.with_name(f"{target.name}.repair.{int(time.time())}.bak")
+            target.replace(backup)
+            backups.append(f"{target} -> {backup}")
         target.symlink_to(source)
         created.append(f"{target} -> {source}")
     if missing and not created:
