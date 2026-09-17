@@ -95,6 +95,11 @@ def _complete_with_single_agent(system_prompt: str, user_prompt: str, agent: Dic
     provider = str(agent.get("provider", "none") or "none").lower()
     if provider == "command":
         provider = "cli"
+    # Menu aliases from `pfl init`: claude -> anthropic, codex -> openai.
+    if provider == "claude":
+        provider = "anthropic"
+    elif provider == "codex":
+        provider = "openai"
     if provider == "none":
         return None
     if provider == "cli":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -216,10 +217,21 @@ def init(
     interactive = (not non_interactive) and sys.stdin.isatty()
     if interactive:
         cfg = survey_config(cfg, target)
+    interactive_run = interactive
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=False)
     cfg = load_config(target)
+    if interactive_run and cfg.get("graph_backend", {}).get("enabled") and cfg.get("graph_backend", {}).get("auto_install"):
+        console.print("\n[bold]Provisioning Neo4j and dependencies...[/bold]")
+        try:
+            provision_neo4j(cfg)
+            console.print("[green]Neo4j is ready.[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Automatic install failed: {e}[/yellow]")
+            console.print(f"[yellow]Run later: pfl repair --config {target}[/yellow]")
+    if not interactive_run and cfg.get("graph_backend", {}).get("enabled"):
+        console.print(f"[yellow]Neo4j backend enabled but not provisioned - run: pfl repair --config {target}[/yellow]")
     ensure_dirs(cfg)
     console.print(f"Created {target}")
     warnings = config_followup_warnings(cfg)
@@ -227,53 +239,191 @@ def init(
         console.print(f"[yellow]Needs attention:[/yellow] {warning}")
 
 
+
+GIT_HISTORY_PRESETS: dict[str, dict[str, Any]] = {
+    # fast: current snapshot + recent commit metadata; no hunks/blame.
+    "fast": {
+        "enabled": True,
+        "max_commits_per_repo": 200,
+        "metadata_days": 30,
+        "patch_hunks": False,
+        "current_blame": False,
+        "rename_detection": False,
+        "cochange_window_days": 90,
+    },
+    # medium: bounded history with hunks; no blame.
+    "medium": {
+        "enabled": True,
+        "max_commits_per_repo": 5000,
+        "metadata_days": None,
+        "patch_hunks": True,
+        "current_blame": False,
+        "rename_detection": True,
+        "cochange_window_days": 365,
+    },
+    # all: full history + hunks + blame.
+    "all": {
+        "enabled": True,
+        "max_commits_per_repo": None,
+        "metadata_days": None,
+        "patch_hunks": True,
+        "current_blame": True,
+        "rename_detection": True,
+        "cochange_window_days": 730,
+    },
+}
+
+INDEX_PRESETS: dict[str, dict[str, Any]] = {
+    # fast: FTS + AST chunks only; no embeddings/reranker (no ML).
+    "fast": {
+        "lexical_fts": True,
+        "embeddings_enabled": False,
+        "reranker_enabled": False,
+    },
+    # full: FTS + AST chunks + embeddings + reranker.
+    "full": {
+        "lexical_fts": True,
+        "embeddings_enabled": True,
+        "reranker_enabled": True,
+    },
+}
+
+# Numbered agent menu shown by `pfl init`. The stored provider stays one of
+# the engine values; claude/codex are aliases resolved here.
+AGENT_MENU: list[tuple[str, str]] = [
+    ("claude", "Claude via Anthropic API (provider anthropic)"),
+    ("codex", "Codex via OpenAI API (provider openai)"),
+    ("cli", "Local CLI command (e.g. ollama run ...)"),
+    ("openai_compatible", "OpenAI-compatible server (Ollama, vLLM, ...)"),
+    ("anthropic_compatible", "Anthropic-compatible gateway"),
+    ("none", "No LLM, deterministic evidence reports only"),
+]
+
+AGENT_MENU_ALIASES: dict[str, str] = {"claude": "anthropic", "codex": "openai"}
+
+
+def _prompt_choice(prompt: str, options: list[str], default: str) -> str:
+    numbered = ", ".join(f"{i + 1}={name}" for i, name in enumerate(options))
+    raw = typer.prompt(f"{prompt} [{numbered}]", default=default).strip().lower()
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(options):
+            return options[idx]
+    if raw in options:
+        return raw
+    return default
+
+
+def _project_slug(target: Path) -> str:
+    name = target.parent.name if target.name in {"proofline.yaml", "config.yaml"} else target.stem
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower() or "default"
+    return slug[:40]
+
+
+def _is_git_repo(path: Path) -> bool:
+    current = path.resolve()
+    while True:
+        if (current / ".git").exists():
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def apply_git_history_preset(cfg: dict[str, Any], preset: str) -> None:
+    values = GIT_HISTORY_PRESETS[preset]
+    cfg["git_history_preset"] = preset
+    gh = cfg.setdefault("git_history", {})
+    gh.update(values)
+
+
+def apply_index_preset(cfg: dict[str, Any], preset: str) -> None:
+    values = INDEX_PRESETS[preset]
+    cfg["index_preset"] = preset
+    indexing = cfg.setdefault("indexing", {})
+    indexing["lexical_fts"] = values["lexical_fts"]
+    indexing.setdefault("embeddings", {})["enabled"] = values["embeddings_enabled"]
+    cfg.setdefault("retrieval", {}).setdefault("reranker", {})["enabled"] = values["reranker_enabled"]
+
+
+def provision_neo4j(cfg: dict[str, Any]) -> None:
+    """Provision the Neo4j Docker container idempotently via pfl repair."""
+    from proofline.repair import run_repair
+
+    config_path_value = str(cfg.get("_config_path") or DEFAULT_CONFIG)
+    steps = run_repair(config_path=config_path_value)
+    failed = [s for s in steps if not s.get("ok")]
+    if failed:
+        details = "; ".join(f"{s.get('name')}: {s.get('details')}" for s in failed[:3])
+        raise RuntimeError(f"Neo4j provisioning failed: {details}")
+
+
 def survey_config(cfg: dict[str, Any], target: Path) -> dict[str, Any]:
     console.print("[bold]Proofline config survey[/bold]")
     console.print(f"Target: {target}")
 
-    console.print("\n[bold]Workspace[/bold]")
-    cfg["workspace"] = typer.prompt("Workspace directory", default=str(cfg.get("workspace") or "./data"))
+    # --- Scope: one repo or many? First question, decides repos.root. ---
+    console.print("\n[bold]Scope[/bold]")
+    scope = _prompt_choice("Index a single repository or multiple? (single, multi)", ["single", "multi"], "single")
     cfg.setdefault("repos", {})
-    cfg["repos"]["root"] = typer.prompt("Repositories directory", default=str(cfg["repos"].get("root") or "./repos"))
-    cfg["repos"]["update_existing"] = typer.confirm("Fetch/update existing repos during sync?", default=bool(cfg["repos"].get("update_existing", True)))
-    max_file_mb = typer.prompt("Max file size to index, MB", default=str(cfg["repos"].get("max_file_mb", 5)))
-    cfg["repos"]["max_file_mb"] = float(max_file_mb)
-
+    if scope == "single":
+        if _is_git_repo(Path.cwd()):
+            cfg["repos"]["root"] = "."
+            console.print("Detected git repository in the current directory; using it.")
+        else:
+            console.print("[yellow]Current directory is not a git repository.[/yellow]")
+            cfg["repos"]["root"] = typer.prompt("Path to the repository to index (no default)")
+    else:
+        cfg["repos"]["root"] = typer.prompt("Directory holding all repositories to index (no default)")
+    # Silent defaults (change later in proofline.yaml): no auto-fetch,
+    # 5 MB file cap, storage under ./.proofline.
+    cfg["repos"]["update_existing"] = False
+    cfg["repos"]["max_file_mb"] = float(cfg["repos"].get("max_file_mb", 5))
+    cfg["workspace"] = "./.proofline"
     root = Path(cfg["workspace"])
     cfg.setdefault("storage", {})
-    cfg["storage"]["duckdb_path"] = typer.prompt("DuckDB path", default=str(root / "kb.duckdb"))
-    cfg["storage"]["sqlite_fts_path"] = typer.prompt("SQLite FTS path", default=str(root / "indexes" / "code_fts.sqlite"))
-    cfg["storage"]["vector_index_path"] = typer.prompt("Vector index path", default=str(root / "indexes" / "code_vectors.faiss"))
-    cfg["storage"]["vector_meta_path"] = typer.prompt("Vector metadata path", default=str(root / "indexes" / "code_vectors_meta.parquet"))
+    cfg["storage"]["duckdb_path"] = str(root / "kb.duckdb")
+    cfg["storage"]["sqlite_fts_path"] = str(root / "indexes" / "code_fts.sqlite")
+    cfg["storage"]["vector_index_path"] = str(root / "indexes" / "code_vectors.faiss")
+    cfg["storage"]["vector_meta_path"] = str(root / "indexes" / "code_vectors_meta.parquet")
 
-    console.print("\n[bold]Git History[/bold]")
-    cfg.setdefault("git_history", {})
-    gh = cfg["git_history"]
-    gh["enabled"] = typer.confirm("Index Git history as Change Graph?", default=bool(gh.get("enabled", True)))
-    gh["patch_hunks"] = typer.confirm("Index patch hunks?", default=bool(gh.get("patch_hunks", True)))
-    gh["current_blame"] = typer.confirm("Build current blame index?", default=bool(gh.get("current_blame", True)))
-    full_history = typer.confirm("Index full Git history? Choose no to set a commit limit.", default=gh.get("max_commits_per_repo") in (None, ""))
-    gh["max_commits_per_repo"] = None if full_history else int(typer.prompt("Max commits per repo", default="5000"))
-    gh["cochange_window_days"] = int(typer.prompt("Co-change window, days", default=str(gh.get("cochange_window_days") or 730)))
+    # --- Git history depth: one choice expands to the full git_history map. ---
+    console.print("\n[bold]Git history depth[/bold]")
+    console.print("  fast: recent commits only, no hunks/blame (quick first index)")
+    console.print("  medium: bounded history with hunks, no blame")
+    console.print("  all: full history + hunks + blame")
+    preset = _prompt_choice("Git history depth? (fast, medium, all)", ["fast", "medium", "all"], "all")
+    apply_git_history_preset(cfg, preset)
 
+    # --- Sources gate: one question, details only on yes (default yes). ---
     console.print("\n[bold]Sources[/bold]")
-    configure_source(cfg, "datadog", "Enable Datadog runtime ingestion?")
-    configure_source(cfg, "bigquery", "Enable BigQuery metadata ingestion?")
-    configure_source(cfg, "confluence", "Enable Confluence ingestion?")
-    configure_source(cfg, "jira", "Enable Jira ingestion?")
-    if cfg.get("datadog", {}).get("enabled"):
-        cfg["datadog"]["site"] = typer.prompt("Datadog site", default=str(cfg["datadog"].get("site") or "datadoghq.com"))
-    for key, label in [("confluence", "Confluence base URL"), ("jira", "Jira base URL")]:
-        if cfg.get(key, {}).get("enabled"):
-            default_url = str(cfg[key].get("base_url") or f"${{{key.upper()}_BASE_URL}}")
-            cfg[key]["base_url"] = typer.prompt(label, default=default_url)
+    want_extra = typer.confirm("Index anything besides Git and code?", default=True)
+    for key in ("datadog", "bigquery", "confluence", "jira"):
+        cfg.setdefault(key, {})["enabled"] = False
+    if want_extra:
+        configure_source(cfg, "datadog", "Enable Datadog runtime ingestion?")
+        configure_source(cfg, "bigquery", "Enable BigQuery metadata ingestion?")
+        configure_source(cfg, "confluence", "Enable Confluence ingestion?")
+        configure_source(cfg, "jira", "Enable Jira ingestion?")
+        # Follow-ups read the answers just given (order matches the confirms).
+        if cfg.get("datadog", {}).get("enabled"):
+            cfg["datadog"]["site"] = typer.prompt("Datadog site", default=str(cfg["datadog"].get("site") or "datadoghq.com"))
+        if cfg.get("confluence", {}).get("enabled"):
+            default_url = str(cfg["confluence"].get("base_url") or "${CONFLUENCE_BASE_URL}")
+            cfg["confluence"]["base_url"] = typer.prompt("Confluence base URL", default=default_url)
+        if cfg.get("jira", {}).get("enabled"):
+            default_url = str(cfg["jira"].get("base_url") or "${JIRA_BASE_URL}")
+            cfg["jira"]["base_url"] = typer.prompt("Jira base URL", default=default_url)
 
-    console.print("\n[bold]Indexes[/bold]")
-    cfg.setdefault("indexing", {}).setdefault("embeddings", {})
-    cfg["indexing"]["lexical_fts"] = typer.confirm("Build lexical full-text search index?", default=bool(cfg["indexing"].get("lexical_fts", True)))
+    # --- Index depth: one choice; provider details only when embeddings on. ---
+    console.print("\n[bold]Index depth[/bold]")
+    console.print("  fast: FTS + AST chunks only, no embeddings/reranker (instant, no ML)")
+    console.print("  full: FTS + AST chunks + embeddings + reranker")
+    index_preset = _prompt_choice("Index depth? (fast, full)", ["fast", "full"], "full")
+    apply_index_preset(cfg, index_preset)
     emb = cfg["indexing"]["embeddings"]
-    emb["enabled"] = typer.confirm("Build vector embeddings?", default=bool(emb.get("enabled", True)))
-    if emb["enabled"]:
+    if emb.get("enabled"):
         emb["provider"] = typer.prompt("Embedding provider (sentence_transformers, openai, openai_compatible, cli)", default=str(emb.get("provider") or "sentence_transformers"))
         emb["model_name"] = typer.prompt("Embedding model", default=str(emb.get("model_name") or "Qwen/Qwen3-Embedding-0.6B"))
         if emb["provider"] == "sentence_transformers":
@@ -284,16 +434,51 @@ def survey_config(cfg: dict[str, Any], target: Path) -> dict[str, Any]:
         elif emb["provider"] == "cli":
             emb["command"] = typer.prompt("Embedding command", default=str(emb.get("command") or ""))
 
-    console.print("\n[bold]Graph & Agent[/bold]")
+    # --- Graph backend: default yes; per-project Docker credentials. ---
+    console.print("\n[bold]Graph backend[/bold]")
+    slug = _project_slug(target)
+    backend_default = f"proofline_neo4j_{slug}"
     cfg.setdefault("graph_backend", {})
-    cfg["graph_backend"]["enabled"] = typer.confirm("Enable external Neo4j graph backend?", default=bool(cfg["graph_backend"].get("enabled", True)))
+    cfg["graph_backend"]["enabled"] = typer.confirm("Use Neo4j graph backend?", default=True)
     if cfg["graph_backend"]["enabled"]:
         cfg["graph_backend"]["uri"] = typer.prompt("Neo4j URI", default=str(cfg["graph_backend"].get("uri") or "bolt://localhost:7687"))
-        cfg["graph_backend"]["username"] = typer.prompt("Neo4j username", default=str(cfg["graph_backend"].get("username") or "neo4j"))
-    cfg.setdefault("agent", {})
-    cfg["agent"]["provider"] = typer.prompt("Agent provider (none, cli, openai, openai_compatible, anthropic, anthropic_compatible)", default=str(cfg["agent"].get("provider") or "none"))
-    if cfg["agent"]["provider"] != "none":
+        cfg["graph_backend"]["username"] = typer.prompt("Neo4j username", default=str(cfg["graph_backend"].get("username") or backend_default))
+        cfg["graph_backend"]["password"] = typer.prompt("Neo4j password", default=str(cfg["graph_backend"].get("password") or backend_default), hide_input=True)
+        cfg["graph_backend"]["database"] = typer.prompt("Neo4j database", default=str(cfg["graph_backend"].get("database") or backend_default))
+        # Back-compat mirror read by pfl repair / CGC stack.
+        cfg.setdefault("neo4j", {})
+        for key in ("uri", "username", "password", "database"):
+            cfg["neo4j"][key] = cfg["graph_backend"][key]
+        auto_install = typer.confirm("Install Neo4j and dependencies automatically now?", default=True)
+        cfg["graph_backend"]["auto_install"] = auto_install
+    else:
+        cfg["graph_backend"]["auto_install"] = False
+
+    # --- Agent: numbered menu, model as the next step for non-none. ---
+    console.print("\n[bold]Answering agent[/bold]")
+    for i, (name, desc) in enumerate(AGENT_MENU, start=1):
+        console.print(f"  {i}. {name} - {desc}")
+    options = [name for name, _ in AGENT_MENU]
+    current = str(cfg.get("agent", {}).get("provider") or "none")
+    # Map stored providers back to menu names for the default.
+    current_menu = "claude" if current == "anthropic" else ("codex" if current == "openai" else current)
+    if current_menu not in options:
+        current_menu = "claude"
+    choice = _prompt_choice("Answering agent?", options, current_menu)
+    provider = AGENT_MENU_ALIASES.get(choice, choice)
+    cfg.setdefault("agent", {})["provider"] = provider
+    if provider != "none":
         cfg["agent"]["model"] = typer.prompt("Agent model", default=str(cfg["agent"].get("model") or ""))
+        if provider == "cli":
+            cfg["agent"]["command"] = typer.prompt("Agent command", default=str(cfg["agent"].get("command") or ""))
+        elif provider in {"openai", "openai_compatible"}:
+            cfg["agent"]["api_key_env"] = typer.prompt("Agent API key env", default=str(cfg["agent"].get("api_key_env") or "OPENAI_API_KEY"))
+            if provider == "openai_compatible":
+                cfg["agent"]["base_url"] = typer.prompt("Agent base URL", default=str(cfg["agent"].get("base_url") or "${OPENAI_BASE_URL}"))
+        elif provider in {"anthropic", "anthropic_compatible"}:
+            cfg["agent"]["api_key_env"] = typer.prompt("Agent API key env", default=str(cfg["agent"].get("api_key_env") or "ANTHROPIC_API_KEY"))
+            if provider == "anthropic_compatible":
+                cfg["agent"]["base_url"] = typer.prompt("Agent base URL", default=str(cfg["agent"].get("base_url") or "${ANTHROPIC_BASE_URL}"))
     return cfg
 
 

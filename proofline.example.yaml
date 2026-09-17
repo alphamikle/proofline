@@ -1,11 +1,14 @@
 # yaml-language-server: $schema=./config.schema.json
-config_version: 2
-workspace: ./data
+config_version: 3
+# Local state lives inside the project to avoid clashes with existing ./data dirs.
+workspace: ./.proofline
 repos:
-  root: ./repos
+  # Single-repo default: pfl runs inside the indexed git repo itself.
+  # For multi-repo setups point this at the parent dir holding all repos.
+  root: .
   # Optional: if present, pipeline can clone missing repos. One URL per line.
   clone_urls_file: null
-  update_existing: true
+  update_existing: false
   max_workers: 1
   include_git_history_metadata: true
   max_file_mb: 5
@@ -62,11 +65,16 @@ repos:
     - Dockerfile
 
 storage:
-  duckdb_path: ./data/kb.duckdb
-  sqlite_fts_path: ./data/indexes/code_fts.sqlite
-  vector_index_path: ./data/indexes/code_vectors.faiss
-  vector_meta_path: ./data/indexes/code_vectors_meta.parquet
+  duckdb_path: ./.proofline/kb.duckdb
+  sqlite_fts_path: ./.proofline/indexes/code_fts.sqlite
+  vector_index_path: ./.proofline/indexes/code_vectors.faiss
+  vector_meta_path: ./.proofline/indexes/code_vectors_meta.parquet
 
+# Git history depth preset (set by `pfl init`):
+#   fast   = recent commits only, no hunks/blame (quick first index)
+#   medium = bounded history with hunks, no blame
+#   all    = full history + hunks + blame (default)
+git_history_preset: all
 git_history:
   enabled: true
   # null or omitted means index the full reachable history in the selected scope.
@@ -191,6 +199,10 @@ jira:
   download_attachments: true
   download_metadata: true
 
+# Index depth preset (set by `pfl init`):
+#   fast = FTS + AST chunks only, no embeddings/reranker (instant answers, no ML)
+#   full = FTS + AST chunks + embeddings + reranker (default)
+index_preset: full
 indexing:
   lexical_fts: true
   chunk_write_batch_size: 5000
@@ -273,13 +285,15 @@ retrieval:
     device: cpu
     batch_size: 8
 
+# Neo4j runs in Docker (container `proofline-neo4j`) provisioned by `pfl init`/`pfl repair`.
+# database/username/password default to proofline_neo4j_<project-dir>; init fills them in.
 graph_backend:
   enabled: true
   provider: neo4j
   uri: bolt://localhost:7687
-  username: neo4j
-  password: codegraphcontext
-  database: neo4j
+  username: proofline_neo4j_default
+  password: proofline_neo4j_default
+  database: proofline_neo4j_default
   batch_size: 1000
   clear_existing: true
 
@@ -328,6 +342,8 @@ agent:
   #     provider: openai
   #     model: gpt-5.2
   #     api_key_env: OPENAI_API_KEY
+  # Set by `pfl init` agent menu: none | claude | codex | cli | openai | openai_compatible | anthropic | anthropic_compatible
+  # claude -> provider anthropic, codex -> provider openai (menu aliases).
   provider: none          # none | cli | openai | openai_compatible | anthropic | anthropic_compatible
   model: null             # example: "gpt-5.2", "claude-sonnet-4-6", "qwen2.5-coder:32b"
   command: null           # used by provider=cli, example: "ollama run qwen2.5-coder:32b"

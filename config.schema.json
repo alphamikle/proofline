@@ -9,7 +9,7 @@
     "workspace": {
       "type": "string",
       "description": "Workspace directory for generated data, indexes, and reports.",
-      "default": "./data"
+      "default": "./.proofline"
     },
     "config_version": {
       "type": "integer",
@@ -23,7 +23,7 @@
         "root": {
           "type": "string",
           "description": "Directory containing repositories to index.",
-          "default": "./repos"
+          "default": "."
         },
         "clone_urls_file": {
           "type": ["string", "null"],
@@ -32,7 +32,7 @@
         "update_existing": {
           "type": "boolean",
           "description": "Fetch and pull repositories that already exist under repos.root.",
-          "default": true
+          "default": false
         },
         "max_workers": { "$ref": "#/definitions/positiveInteger" },
         "include_git_history_metadata": {
@@ -353,9 +353,10 @@
         "enabled": { "type": "boolean", "default": true },
         "provider": { "type": "string", "enum": ["neo4j"], "default": "neo4j" },
         "uri": { "type": "string", "default": "bolt://localhost:7687" },
-        "username": { "type": "string", "default": "neo4j" },
-        "password": { "type": "string" },
-        "database": { "type": "string", "default": "neo4j" },
+        "username": { "type": "string", "description": "Neo4j user (init defaults to proofline_neo4j_<project>)." },
+        "password": { "type": "string", "description": "Neo4j password (init defaults to proofline_neo4j_<project>)." },
+        "database": { "type": "string", "description": "Neo4j database (init defaults to proofline_neo4j_<project>)." },
+        "auto_install": { "type": "boolean", "default": false, "description": "Provision the Neo4j Docker container automatically after init." },
         "batch_size": { "$ref": "#/definitions/positiveInteger" },
         "clear_existing": { "type": "boolean", "default": true }
       }
@@ -412,7 +413,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["none", "cli", "openai", "openai_compatible", "anthropic", "anthropic_compatible"],
+          "enum": ["none", "cli", "openai", "openai_compatible", "anthropic", "anthropic_compatible", "claude", "codex"],
           "default": "none"
         },
         "model": { "$ref": "#/definitions/nullableString" },
@@ -446,6 +447,18 @@
           }
         }
       }
+    },
+    "git_history_preset": {
+      "type": "string",
+      "enum": ["fast", "medium", "all"],
+      "default": "all",
+      "description": "Init preset expanding to git_history: fast=recent only, medium=bounded+hunks, all=full+hunks+blame."
+    },
+    "index_preset": {
+      "type": "string",
+      "enum": ["fast", "full"],
+      "default": "full",
+      "description": "Init preset: fast=FTS only, full=FTS+embeddings+reranker."
     }
   },
   "definitions": {

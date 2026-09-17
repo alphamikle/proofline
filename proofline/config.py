@@ -10,7 +10,7 @@ import yaml
 
 DEFAULT_CONFIG = "proofline.yaml"
 CONFIG_ENV_VAR = "PROOFLINE_CONFIG"
-CONFIG_SHAPE_VERSION = 2
+CONFIG_SHAPE_VERSION = 3
 
 
 def package_root() -> Path:
@@ -90,8 +90,10 @@ def default_config() -> Dict[str, Any]:
 def minimal_default_config() -> Dict[str, Any]:
     return {
         "config_version": CONFIG_SHAPE_VERSION,
-        "workspace": "./data",
-        "repos": {"root": "./repos", "update_existing": True},
+        "workspace": "./.proofline",
+        "git_history_preset": "all",
+        "index_preset": "full",
+        "repos": {"root": ".", "update_existing": False},
         "storage": {},
         "git_history": {},
         "datadog": {"enabled": False},
@@ -118,7 +120,10 @@ def minimal_default_config() -> Dict[str, Any]:
             "embeddings": {"enabled": True},
         },
         "retrieval": {"reranker": {"enabled": True}},
-        "graph_backend": {"enabled": False, "provider": "neo4j"},
+        "graph_backend": {"enabled": True, "provider": "neo4j",
+                          "username": "proofline_neo4j_default",
+                          "password": "proofline_neo4j_default",
+                          "database": "proofline_neo4j_default"},
         "code_graph": {"enabled": False},
         "visualization": {"output_path": ""},
         "agent": {"provider": "none"},
@@ -134,12 +139,33 @@ def migrate_config_file(path: str | Path, *, quiet: bool = False) -> Tuple[Dict[
     missing = missing_paths(defaults, original)
     added = [path for path in missing if "." not in path]
     merged = deep_merge(defaults, original)
+    migrated_text = original_text
+    if original.get("config_version", 0) < 3:
+        # v3 renames the default workspace ./data -> ./.proofline and the
+        # default repos root ./repos -> . Only rewrite values that still
+        # carry the old defaults; explicit user paths are preserved.
+        if str(original.get("workspace") or "") == "./data":
+            merged["workspace"] = "./.proofline"
+        repos = dict(original.get("repos") or {})
+        if str(repos.get("root") or "") == "./repos":
+            merged.setdefault("repos", {})["root"] = "."
+        storage = dict((original.get("storage") or {}))
+        for key, old_path in [
+            ("duckdb_path", "./data/kb.duckdb"),
+            ("sqlite_fts_path", "./data/indexes/code_fts.sqlite"),
+            ("vector_index_path", "./data/indexes/code_vectors.faiss"),
+            ("vector_meta_path", "./data/indexes/code_vectors_meta.parquet"),
+        ]:
+            if str(storage.get(key) or "") == old_path:
+                merged.setdefault("storage", {})[key] = old_path.replace("./data", "./.proofline", 1)
     if merged.get("config_version") != CONFIG_SHAPE_VERSION:
         merged["config_version"] = CONFIG_SHAPE_VERSION
         if "config_version" not in added:
             added.append("config_version")
+        # v3 default-path renames above must also land on disk, not just in memory.
+        migrated_text = migrate_config_text(migrated_text, original, merged)
     if added:
-        migrated = migrate_config_text(original_text, original, merged)
+        migrated = migrate_config_text(migrated_text, original, merged)
         path.write_text(migrated, encoding="utf-8")
         if not quiet:
             shown = ", ".join(added[:12])
@@ -296,6 +322,12 @@ def migrate_config_text(text: str, original: Dict[str, Any], merged: Dict[str, A
     if "config_version" not in existing:
         block = f"config_version: {CONFIG_SHAPE_VERSION}\n"
         out = insert_top_level_block(out, "config_version", block, ["config_version"] + order)
+    # v3 renames of default paths: rewrite scalar lines that still carry the
+    # old defaults so on-disk text matches the merged values.
+    if merged.get("workspace") == "./.proofline" and "workspace: ./data" in out:
+        out = out.replace("workspace: ./data", "workspace: ./.proofline", 1)
+    if str((merged.get("repos") or {}).get("root")) == "." and "root: ./repos" in out:
+        out = out.replace("root: ./repos", "root: .", 1)
     return out
 
 
@@ -394,7 +426,7 @@ def load_config(path: str | Path, *, quiet: bool = False) -> Dict[str, Any]:
     cfg["_config_path"] = str(path)
     cfg["_config_dir"] = str(path.parent)
     _normalize_graph_backend(cfg)
-    root = Path(cfg.get("workspace", "./data"))
+    root = Path(cfg.get("workspace", "./.proofline"))
     cfg["workspace"] = str(root)
     cfg.setdefault("storage", {})
     cfg["storage"].setdefault("duckdb_path", str(root / "kb.duckdb"))
@@ -404,7 +436,7 @@ def load_config(path: str | Path, *, quiet: bool = False) -> Dict[str, Any]:
     cfg.setdefault("visualization", {})
     cfg["visualization"].setdefault("output_path", str(root / "visualization" / "graph.json"))
     cfg.setdefault("repos", {})
-    cfg["repos"].setdefault("root", "./repos")
+    cfg["repos"].setdefault("root", ".")
     cfg.setdefault("git_history", {})
     gh = cfg["git_history"]
     gh.setdefault("enabled", True)
