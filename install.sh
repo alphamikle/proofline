@@ -141,7 +141,20 @@ install_python_env() {
   validate_checkout
   resolve_python
   log "Creating Python environment ($PROOFLINE_PYTHON)"
-  "$PROOFLINE_PYTHON" -m venv "$PROOFLINE_DIR/.venv"
+  # An existing venv may be pinned to an older interpreter (e.g. Xcode
+  # python3 3.9) that cannot satisfy requirements.txt. Recreate it when
+  # its Python is older than PROOFLINE_MIN_PYTHON.
+  if [[ -x "$PROOFLINE_DIR/.venv/bin/python" ]]; then
+    existing_ver="$("$PROOFLINE_DIR/.venv/bin/python" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "0")"
+    # existing is new enough when the minimum sorts first (min <= existing).
+    if [[ "$(printf '%s\n%s\n' "$PROOFLINE_MIN_PYTHON" "$existing_ver" | sort -V | head -n1)" != "$PROOFLINE_MIN_PYTHON" ]]; then
+      log "Existing venv uses Python $existing_ver (< $PROOFLINE_MIN_PYTHON); recreating it"
+      rm -rf "$PROOFLINE_DIR/.venv"
+    fi
+  fi
+  if [[ ! -x "$PROOFLINE_DIR/.venv/bin/python" ]]; then
+    "$PROOFLINE_PYTHON" -m venv "$PROOFLINE_DIR/.venv"
+  fi
   "$PROOFLINE_DIR/.venv/bin/python" -m pip install --upgrade pip
 
   log "Installing Proofline"
