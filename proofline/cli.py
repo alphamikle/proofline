@@ -365,6 +365,7 @@ def provision_neo4j(cfg: dict[str, Any]) -> None:
         config_path=config_path_value,
         skip_python_deps=True,
         skip_bin_links=True,
+        cgc_mode="neo4j",
     )
     failed = [s for s in steps if not s.get("ok")]
     if failed:
@@ -400,9 +401,10 @@ def _neo4j_container_healthy(cfg: dict[str, Any]) -> bool:
     if name not in (ps.stdout or "").split():
         return False
     try:
+        # Community admin account is always neo4j (project users exist on Enterprise only).
         probe = subprocess.run(
             [docker, "exec", name, "cypher-shell",
-             "-u", env.get("NEO4J_USER", "neo4j"), "-p", env.get("NEO4J_PASSWORD", ""),
+             "-u", "neo4j", "-p", env.get("NEO4J_PASSWORD", ""),
              "RETURN 1;"],
             text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=30,
         )
@@ -495,6 +497,7 @@ def survey_config(cfg: dict[str, Any], target: Path) -> dict[str, Any]:
     cfg.setdefault("graph_backend", {})
     cfg["graph_backend"]["enabled"] = typer.confirm("Use Neo4j graph backend?", default=True)
     if cfg["graph_backend"]["enabled"]:
+        console.print("[dim]Neo4j Community connects as admin 'neo4j'; project names below apply on Enterprise. Isolation comes from the per-project container.[/dim]")
         cfg["graph_backend"]["container_name"] = typer.prompt("Neo4j container name", default=str(cfg["graph_backend"].get("container_name") or container_default))
         cfg["graph_backend"]["uri"] = typer.prompt("Neo4j URI", default=str(cfg["graph_backend"].get("uri") or "bolt://localhost:7687"))
         cfg["graph_backend"]["username"] = typer.prompt("Neo4j username", default=str(cfg["graph_backend"].get("username") or backend_default))
@@ -581,9 +584,14 @@ def repair(
     skip_python_deps: bool = typer.Option(False, "--skip-python-deps", help="Skip reinstalling Proofline Python dependencies."),
     skip_cgc: bool = typer.Option(False, "--skip-cgc", help="Skip CGC, SCIP, Docker, and Neo4j repair."),
     skip_bin_links: bool = typer.Option(False, "--skip-bin-links", help="Skip relinking proofline/pfl into the bin directory."),
+    only_neo4j: bool = typer.Option(False, "--only-neo4j", help="Only start Neo4j in Docker (skip CGC/SCIP toolchain)."),
+    only_scip: bool = typer.Option(False, "--only-scip", help="Only install CGC/SCIP indexers (skip Neo4j)."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Repair local dependencies, config directories, CGC, and local Neo4j Docker runtime."""
+    if only_neo4j and only_scip:
+        raise typer.BadParameter("Pass only one of --only-neo4j / --only-scip.")
+    cgc_mode = "neo4j" if only_neo4j else ("scip" if only_scip else "full")
     steps = run_repair(
         config_path=config_path(config),
         bin_dir=bin_dir,
@@ -591,6 +599,7 @@ def repair(
         skip_python_deps=skip_python_deps,
         skip_cgc=skip_cgc,
         skip_bin_links=skip_bin_links,
+        cgc_mode=cgc_mode,
     )
     if json_output:
         typer.echo(json_dumps({"steps": steps, "ok": all(step["ok"] for step in steps)}))

@@ -60,6 +60,17 @@ sudo_if_needed() {
   fi
 }
 
+usage() {
+  cat <<EOF
+Usage: cgc.sh [--only-neo4j] [--only-scip]
+
+  --only-neo4j   Start Neo4j in Docker only (no CGC CLI, no SCIP indexers).
+  --only-scip    Install CGC CLI + SCIP indexers only (no Neo4j).
+  (no flags)     Full stack: CGC + SCIP indexers + Neo4j.
+EOF
+  exit 0
+}
+
 ensure_package() {
   package="$1"
   command_name="${2:-$1}"
@@ -564,6 +575,8 @@ start_neo4j() {
 
   docker_cmd pull "$NEO4J_IMAGE"
 
+  # Neo4j requires the admin account to be neo4j; per-project users and
+  # databases are created after first boot (see ensure_neo4j_project_db).
   if docker_cmd ps -a --format '{{.Names}}' | grep -qx "$NEO4J_CONTAINER_NAME"; then
     current_image="$(docker_cmd inspect -f '{{.Config.Image}}' "$NEO4J_CONTAINER_NAME")"
     if [ "$current_image" != "$NEO4J_IMAGE" ]; then
@@ -571,17 +584,17 @@ start_neo4j() {
     fi
     docker_cmd start "$NEO4J_CONTAINER_NAME" >/dev/null
   else
-    docker_cmd volume create cgc_neo4j_data >/dev/null
-    docker_cmd volume create cgc_neo4j_logs >/dev/null
+    docker_cmd volume create "${NEO4J_CONTAINER_NAME}_data" >/dev/null
+    docker_cmd volume create "${NEO4J_CONTAINER_NAME}_logs" >/dev/null
     docker_cmd run -d \
       --name "$NEO4J_CONTAINER_NAME" \
       -p "$NEO4J_HTTP_PORT:7474" \
       -p "$NEO4J_BOLT_PORT:7687" \
-      -e "NEO4J_AUTH=$NEO4J_USER/$NEO4J_PASSWORD" \
+      -e "NEO4J_AUTH=neo4j/$NEO4J_PASSWORD" \
       -e "NEO4J_server_memory_heap_initial__size=512m" \
       -e "NEO4J_server_memory_heap_max__size=2G" \
-      -v cgc_neo4j_data:/data \
-      -v cgc_neo4j_logs:/logs \
+      -v "${NEO4J_CONTAINER_NAME}_data:/data" \
+      -v "${NEO4J_CONTAINER_NAME}_logs:/logs" \
       "$NEO4J_IMAGE" >/dev/null
   fi
 }
@@ -590,9 +603,10 @@ wait_for_neo4j() {
   log "Waiting for Neo4j Bolt endpoint"
   for _ in $(seq 1 90); do
     if docker_cmd exec "$NEO4J_CONTAINER_NAME" cypher-shell \
-      -u "$NEO4J_USER" \
+      -u neo4j \
       -p "$NEO4J_PASSWORD" \
       'RETURN 1;' >/dev/null 2>&1; then
+      ensure_neo4j_project_db
       return
     fi
     sleep 2
@@ -600,6 +614,18 @@ wait_for_neo4j() {
 
   docker_cmd logs --tail 80 "$NEO4J_CONTAINER_NAME" >&2 || true
   die "Neo4j did not become ready."
+}
+
+ensure_neo4j_project_db() {
+  # neo4j:5-community is single-database: everything lives in the default
+  # `neo4j` database behind the fixed admin account `neo4j`. Per-project
+  # isolation comes from the container + volume (one per project).
+  # The project database/user names stay in the config for Enterprise
+  # upgrades, but Community ignores them by design.
+  if [ "$NEO4J_USER" != "neo4j" ] || [ "$NEO4J_DATABASE" != "neo4j" ]; then
+    log "Note: Neo4j Community uses database 'neo4j' / user 'neo4j'; project names ($NEO4J_DATABASE/$NEO4J_USER) apply on Enterprise."
+  fi
+  return 0
 }
 
 set_cgc_env() {
@@ -664,10 +690,39 @@ verify_installation() {
 }
 
 main() {
+  mode="full"
+  for arg in "$@"; do
+    case "$arg" in
+      --only-neo4j) mode="neo4j" ;;
+      --only-scip|--only-cgc) mode="scip" ;;
+      -h|--help) usage ;;
+    esac
+  done
+
   ensure_python
   ensure_docker
   ensure_docker_running
+  if [ "$mode" = "neo4j" ]; then
+    start_neo4j
+    wait_for_neo4j
+    cat <<EOF
+
+Neo4j is ready.
+
+  Browser: http://localhost:$NEO4J_HTTP_PORT
+  Bolt:    $NEO4J_URI
+  User:    $NEO4J_USER
+  Pass:    $NEO4J_PASSWORD
+
+EOF
+    return
+  fi
   install_cgc
+  if [ "$mode" = "scip" ]; then
+    install_scip_indexers
+    verify_installation
+    return
+  fi
   install_scip_indexers
   start_neo4j
   wait_for_neo4j

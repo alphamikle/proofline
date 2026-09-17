@@ -31,6 +31,7 @@ def run_repair(
     skip_python_deps: bool = False,
     skip_cgc: bool = False,
     skip_bin_links: bool = False,
+    cgc_mode: str = "full",
 ) -> list[dict[str, Any]]:
     root = package_root()
     path = Path(config_path).expanduser()
@@ -51,7 +52,7 @@ def run_repair(
         steps.append(RepairStep("cli_links", True, "skipped", "--skip-bin-links"))
 
     if not skip_cgc:
-        repair_cgc_stack(root, cfg or {}, dry_run=dry_run, steps=steps)
+        repair_cgc_stack(root, cfg or {}, dry_run=dry_run, steps=steps, only=cgc_mode)
     else:
         steps.append(RepairStep("cgc_stack", True, "skipped", "--skip-cgc"))
 
@@ -153,7 +154,15 @@ def link_cli_binaries(*, bin_dir: Optional[str], dry_run: bool, steps: list[Repa
         steps.append(RepairStep("cli_links", True, "linked", details))
 
 
-def repair_cgc_stack(root: Path, cfg: dict[str, Any], *, dry_run: bool, steps: list[RepairStep]) -> None:
+def repair_cgc_stack(
+    root: Path,
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool,
+    steps: list[RepairStep],
+    only: str = "full",
+) -> None:
+    """Run scripts/cgc.sh. only="neo4j" starts just Neo4j (no CGC/SCIP)."""
     script = root / "scripts" / "cgc.sh"
     if not script.exists():
         steps.append(RepairStep("cgc_stack", False, "missing_script", str(script)))
@@ -162,6 +171,10 @@ def repair_cgc_stack(root: Path, cfg: dict[str, Any], *, dry_run: bool, steps: l
     env = os.environ.copy()
     env.update(cgc_environment(cfg))
     cmd = ["bash", str(script)]
+    if only == "neo4j":
+        cmd.append("--only-neo4j")
+    elif only == "scip":
+        cmd.append("--only-scip")
     if dry_run:
         details = " ".join(f"{k}={v}" for k, v in sorted(cgc_environment(cfg).items()))
         steps.append(RepairStep("cgc_stack", True, "would_run", f"{details} {' '.join(cmd)}"))
@@ -172,7 +185,7 @@ def repair_cgc_stack(root: Path, cfg: dict[str, Any], *, dry_run: bool, steps: l
         steps.append(RepairStep("cgc_stack", False, "failed", f"{' '.join(cmd)} exited {result.returncode}"))
         return
     steps.append(RepairStep("cgc_stack", True, "repaired", str(script)))
-    verify_cgc_runtime(env, cfg, steps=steps)
+    verify_cgc_runtime(env, cfg, steps=steps, neo4j_only=(only == "neo4j"))
 
 
 def cgc_container_name(cfg: dict[str, Any]) -> str:
@@ -204,14 +217,17 @@ def cgc_environment(cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def verify_cgc_runtime(env: dict[str, str], cfg: dict[str, Any] | None = None, *, steps: list[RepairStep]) -> None:
-    cgc = shutil.which("cgc") or str(Path.home() / ".local" / "bin" / "cgc")
-    if Path(cgc).exists() or shutil.which("cgc"):
-        result = subprocess.run([cgc, "--version"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        details = (result.stdout or result.stderr or cgc).strip()
-        steps.append(RepairStep("cgc", result.returncode == 0, "verified" if result.returncode == 0 else "failed", details))
+def verify_cgc_runtime(env: dict[str, str], cfg: dict[str, Any] | None = None, *, steps: list[RepairStep], neo4j_only: bool = False) -> None:
+    if neo4j_only:
+        steps.append(RepairStep("cgc", True, "skipped", "neo4j-only mode"))
     else:
-        steps.append(RepairStep("cgc", False, "missing", "cgc is not on PATH and ~/.local/bin/cgc does not exist"))
+        cgc = shutil.which("cgc") or str(Path.home() / ".local" / "bin" / "cgc")
+        if Path(cgc).exists() or shutil.which("cgc"):
+            result = subprocess.run([cgc, "--version"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            details = (result.stdout or result.stderr or cgc).strip()
+            steps.append(RepairStep("cgc", result.returncode == 0, "verified" if result.returncode == 0 else "failed", details))
+        else:
+            steps.append(RepairStep("cgc", False, "missing", "cgc is not on PATH and ~/.local/bin/cgc does not exist"))
 
     docker = shutil.which("docker")
     if not docker:

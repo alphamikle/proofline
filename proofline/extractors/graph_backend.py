@@ -30,6 +30,12 @@ def publish_graph_backend(kb, cfg: Dict[str, Any]) -> pd.DataFrame:
             "evidence_count": 0, "status": "disabled", "details": "",
         }])
 
+    # neo4j:5-community is single-database behind the fixed admin account:
+    # always connect as neo4j to the default database regardless of the
+    # per-project names in config (those apply on Enterprise).
+    neo = dict(neo)
+    neo["username"] = "neo4j"
+    neo["database"] = "neo4j"
     nodes = kb.query_df("SELECT * FROM nodes")
     edges = kb.query_df("SELECT * FROM edges")
     evidence = kb.query_df("SELECT * FROM evidence")
