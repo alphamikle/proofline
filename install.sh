@@ -9,6 +9,8 @@ PROOFLINE_BIN_DIR="${PROOFLINE_BIN_DIR:-$HOME/.local/bin}"
 PROOFLINE_INSTALL_CGC="${PROOFLINE_INSTALL_CGC:-0}"
 PROOFLINE_LOCAL_SOURCE="${PROOFLINE_LOCAL_SOURCE:-0}"
 PROOFLINE_SOURCE_DIR="${PROOFLINE_SOURCE_DIR:-}"
+# Minimum Python for `pip install -r requirements.txt` (mcp>=1.0.0 needs 3.10+).
+PROOFLINE_MIN_PYTHON="${PROOFLINE_MIN_PYTHON:-3.10}"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -95,9 +97,50 @@ validate_checkout() {
   [[ -d "$PROOFLINE_DIR/proofline" ]] || fail "Installed checkout at $PROOFLINE_DIR is missing the proofline package."
 }
 
+# Pick a python3 >= PROOFLINE_MIN_PYTHON, else fail with install hints.
+# macOS note: /usr/bin/python3 is the Xcode stub (3.9, no newer wheels for
+# mcp>=1.0.0). Prefer Homebrew python3.14/3.13/3.12/3.11/3.10 when present.
+resolve_python() {
+  local candidates=()
+  if [[ -n "${PROOFLINE_PYTHON:-}" && "$PROOFLINE_PYTHON" != "python3" ]]; then
+    candidates+=("$PROOFLINE_PYTHON")
+  fi
+  candidates+=(
+    python3.14 python3.13 python3.12 python3.11 python3.10
+    /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12
+    /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10
+    /usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12
+    /usr/local/bin/python3.11 /usr/local/bin/python3.10
+    python3
+  )
+  local cand ver
+  for cand in "${candidates[@]}"; do
+    if ! have "$cand" && [[ ! -x "$cand" ]]; then
+      continue
+    fi
+    ver="$("$cand" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
+    [[ -z "$ver" ]] && continue
+    # ver is new enough when the minimum sorts first (min <= ver).
+    if [[ "$(printf '%s\n%s\n' "$PROOFLINE_MIN_PYTHON" "$ver" | sort -V | head -n1)" == "$PROOFLINE_MIN_PYTHON" ]]; then
+      PROOFLINE_PYTHON="$cand"
+      log "Using Python $ver ($cand)"
+      return 0
+    fi
+  done
+  fail "No Python >= $PROOFLINE_MIN_PYTHON found (PROOFLINE_PYTHON=$PROOFLINE_PYTHON resolved to $("$PROOFLINE_PYTHON" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo unknown)).
+
+Install one of:
+  brew install python@3.12        # then rerun install.sh (auto-detected)
+  PROOFLINE_PYTHON=/path/to/python3.12 curl ... | bash
+
+Why: requirements.txt needs mcp>=1.0.0, which has no Python 3.9 wheels.
+The macOS Xcode /usr/bin/python3 (3.9) cannot install it."
+}
+
 install_python_env() {
   validate_checkout
-  log "Creating Python environment"
+  resolve_python
+  log "Creating Python environment ($PROOFLINE_PYTHON)"
   "$PROOFLINE_PYTHON" -m venv "$PROOFLINE_DIR/.venv"
   "$PROOFLINE_DIR/.venv/bin/python" -m pip install --upgrade pip
 
