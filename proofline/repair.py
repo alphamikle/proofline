@@ -172,7 +172,13 @@ def repair_cgc_stack(root: Path, cfg: dict[str, Any], *, dry_run: bool, steps: l
         steps.append(RepairStep("cgc_stack", False, "failed", f"{' '.join(cmd)} exited {result.returncode}"))
         return
     steps.append(RepairStep("cgc_stack", True, "repaired", str(script)))
-    verify_cgc_runtime(env, steps=steps)
+    verify_cgc_runtime(env, cfg, steps=steps)
+
+
+def cgc_container_name(cfg: dict[str, Any]) -> str:
+    """Per-project Neo4j container name (defaults to the legacy shared one)."""
+    neo = dict(cfg.get("neo4j") or cfg.get("graph_backend") or {})
+    return str(neo.get("container_name") or "cgc-neo4j")
 
 
 def cgc_environment(cfg: dict[str, Any]) -> dict[str, str]:
@@ -188,6 +194,7 @@ def cgc_environment(cfg: dict[str, Any]) -> dict[str, str]:
     if host not in {"localhost", "127.0.0.1", "::1"}:
         http_port = str(os.getenv("NEO4J_HTTP_PORT") or http_port)
     return {
+        "NEO4J_CONTAINER_NAME": cgc_container_name(cfg),
         "NEO4J_URI": uri,
         "NEO4J_USER": username,
         "NEO4J_PASSWORD": password,
@@ -197,7 +204,7 @@ def cgc_environment(cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def verify_cgc_runtime(env: dict[str, str], *, steps: list[RepairStep]) -> None:
+def verify_cgc_runtime(env: dict[str, str], cfg: dict[str, Any] | None = None, *, steps: list[RepairStep]) -> None:
     cgc = shutil.which("cgc") or str(Path.home() / ".local" / "bin" / "cgc")
     if Path(cgc).exists() or shutil.which("cgc"):
         result = subprocess.run([cgc, "--version"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -210,7 +217,7 @@ def verify_cgc_runtime(env: dict[str, str], *, steps: list[RepairStep]) -> None:
     if not docker:
         steps.append(RepairStep("neo4j_docker", False, "missing", "docker"))
         return
-    container_name = env.get("NEO4J_CONTAINER_NAME", "cgc-neo4j")
+    container_name = env.get("NEO4J_CONTAINER_NAME") or cgc_container_name(cfg or {})
     result = subprocess.run(
         [docker, "ps", "--filter", f"name=^/{container_name}$", "--format", "{{.Names}} {{.Status}}"],
         text=True,

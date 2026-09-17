@@ -352,6 +352,7 @@
       "properties": {
         "enabled": { "type": "boolean", "default": true },
         "provider": { "type": "string", "enum": ["neo4j"], "default": "neo4j" },
+        "container_name": { "type": "string", "description": "Docker container name (init defaults to proofline-neo4j-<project>)." },
         "uri": { "type": "string", "default": "bolt://localhost:7687" },
         "username": { "type": "string", "description": "Neo4j user (init defaults to proofline_neo4j_<project>)." },
         "password": { "type": "string", "description": "Neo4j password (init defaults to proofline_neo4j_<project>)." },

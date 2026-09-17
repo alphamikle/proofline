@@ -348,15 +348,67 @@ def apply_index_preset(cfg: dict[str, Any], preset: str) -> None:
 
 
 def provision_neo4j(cfg: dict[str, Any]) -> None:
-    """Provision the Neo4j Docker container idempotently via pfl repair."""
-    from proofline.repair import run_repair
+    """Provision the Neo4j Docker container idempotently via pfl repair.
+
+    Skips pip/python/CLI-link steps: those already exist in the running
+    install. Only the CGC/SCIP/Neo4j stack runs, with credentials from cfg.
+    Pre-checks a healthy container with matching credentials first so a
+    second `pfl init` does not reinstall SCIP toolchains or repull images.
+    """
+    from proofline.repair import cgc_environment, run_repair
 
     config_path_value = str(cfg.get("_config_path") or DEFAULT_CONFIG)
-    steps = run_repair(config_path=config_path_value)
+    if _neo4j_container_healthy(cfg):
+        console.print("[green]Neo4j container already running with these credentials; skipping install.[/green]")
+        return
+    steps = run_repair(
+        config_path=config_path_value,
+        skip_python_deps=True,
+        skip_bin_links=True,
+    )
     failed = [s for s in steps if not s.get("ok")]
     if failed:
         details = "; ".join(f"{s.get('name')}: {s.get('details')}" for s in failed[:3])
         raise RuntimeError(f"Neo4j provisioning failed: {details}")
+    if not _neo4j_container_healthy(cfg):
+        env = cgc_environment(cfg)
+        raise RuntimeError(
+            "Neo4j install finished but the container is not responding "
+            f"({env.get('NEO4J_URI')}). Run: pfl repair --config {config_path_value}"
+        )
+
+
+def _neo4j_container_healthy(cfg: dict[str, Any]) -> bool:
+    """True when the configured Neo4j container answers with these creds."""
+    import shutil
+    import subprocess
+
+    from proofline.repair import cgc_environment
+
+    docker = shutil.which("docker")
+    if not docker:
+        return False
+    env = cgc_environment(cfg)
+    name = env.get("NEO4J_CONTAINER_NAME", "cgc-neo4j")
+    try:
+        ps = subprocess.run(
+            [docker, "ps", "--filter", f"name=^/{name}$", "--format", "{{.Names}}"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=15,
+        )
+    except Exception:
+        return False
+    if name not in (ps.stdout or "").split():
+        return False
+    try:
+        probe = subprocess.run(
+            [docker, "exec", name, "cypher-shell",
+             "-u", env.get("NEO4J_USER", "neo4j"), "-p", env.get("NEO4J_PASSWORD", ""),
+             "RETURN 1;"],
+            text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=30,
+        )
+    except Exception:
+        return False
+    return probe.returncode == 0
 
 
 def survey_config(cfg: dict[str, Any], target: Path) -> dict[str, Any]:
@@ -438,16 +490,19 @@ def survey_config(cfg: dict[str, Any], target: Path) -> dict[str, Any]:
     console.print("\n[bold]Graph backend[/bold]")
     slug = _project_slug(target)
     backend_default = f"proofline_neo4j_{slug}"
+    # Per-project container: one Neo4j per indexed project, matching creds.
+    container_default = f"proofline-neo4j-{slug}"
     cfg.setdefault("graph_backend", {})
     cfg["graph_backend"]["enabled"] = typer.confirm("Use Neo4j graph backend?", default=True)
     if cfg["graph_backend"]["enabled"]:
+        cfg["graph_backend"]["container_name"] = typer.prompt("Neo4j container name", default=str(cfg["graph_backend"].get("container_name") or container_default))
         cfg["graph_backend"]["uri"] = typer.prompt("Neo4j URI", default=str(cfg["graph_backend"].get("uri") or "bolt://localhost:7687"))
         cfg["graph_backend"]["username"] = typer.prompt("Neo4j username", default=str(cfg["graph_backend"].get("username") or backend_default))
         cfg["graph_backend"]["password"] = typer.prompt("Neo4j password", default=str(cfg["graph_backend"].get("password") or backend_default), hide_input=True)
         cfg["graph_backend"]["database"] = typer.prompt("Neo4j database", default=str(cfg["graph_backend"].get("database") or backend_default))
         # Back-compat mirror read by pfl repair / CGC stack.
         cfg.setdefault("neo4j", {})
-        for key in ("uri", "username", "password", "database"):
+        for key in ("container_name", "uri", "username", "password", "database"):
             cfg["neo4j"][key] = cfg["graph_backend"][key]
         auto_install = typer.confirm("Install Neo4j and dependencies automatically now?", default=True)
         cfg["graph_backend"]["auto_install"] = auto_install

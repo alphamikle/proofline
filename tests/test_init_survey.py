@@ -136,8 +136,8 @@ class SurveyFlowTests(unittest.TestCase):
                 ["single", "medium", "full", "claude"],
                 [True, True, False, True, False, True, False],
                 ["datadoghq.eu", "https://c.example", "sentence_transformers",
-                 "Qwen-test", "auto", "bolt://h:7687", "u1", "p1", "db1",
-                 "sonnet", "MY_KEY"],
+                 "Qwen-test", "auto", "proofline-neo4j-probe", "bolt://h:7687",
+                 "u1", "p1", "db1", "sonnet", "MY_KEY"],
                 str(root),
             )
             self.assertEqual(out["git_history_preset"], "medium")
@@ -147,6 +147,7 @@ class SurveyFlowTests(unittest.TestCase):
             self.assertEqual(out["datadog"]["site"], "datadoghq.eu")
             self.assertFalse(out["bigquery"]["enabled"])
             self.assertEqual(out["confluence"]["base_url"], "https://c.example")
+            self.assertEqual(out["graph_backend"]["container_name"], "proofline-neo4j-probe")
             self.assertEqual(out["graph_backend"]["username"], "u1")
             self.assertEqual(out["neo4j"]["username"], "u1")
             self.assertEqual(out["agent"]["provider"], "anthropic")
@@ -175,6 +176,20 @@ class SurveyFlowTests(unittest.TestCase):
             self.assertFalse(out["indexing"]["embeddings"]["enabled"])
             self.assertFalse(out["retrieval"]["reranker"]["enabled"])
             self.assertTrue(out["indexing"]["lexical_fts"])
+
+
+class ContainerNameTests(unittest.TestCase):
+    def test_default_container_is_legacy(self):
+        from proofline.repair import cgc_container_name
+
+        self.assertEqual(cgc_container_name({}), "cgc-neo4j")
+
+    def test_custom_container_flows_to_env(self):
+        from proofline.repair import cgc_container_name, cgc_environment
+
+        cfg = {"graph_backend": {"container_name": "proofline-neo4j-detax"}}
+        self.assertEqual(cgc_container_name(cfg), "proofline-neo4j-detax")
+        self.assertEqual(cgc_environment(cfg)["NEO4J_CONTAINER_NAME"], "proofline-neo4j-detax")
 
 
 if __name__ == "__main__":

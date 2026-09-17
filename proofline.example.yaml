@@ -290,6 +290,7 @@ retrieval:
 graph_backend:
   enabled: true
   provider: neo4j
+  container_name: proofline-neo4j-default
   uri: bolt://localhost:7687
   username: proofline_neo4j_default
   password: proofline_neo4j_default
