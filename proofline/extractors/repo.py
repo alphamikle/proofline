@@ -50,7 +50,15 @@ def find_git_repos(root: Path, exclude_dirs: Iterable[str] = ()) -> List[Path]:
 
 
 def repo_id_from_path(repo: Path) -> str:
-    return repo.name
+    name = repo.name
+    if name:
+        return name
+    # Path(".").name == "" — fall back to the resolved directory name
+    # so single-repo setups (repos.root: ".") get a real id, not "".
+    try:
+        return Path(repo).expanduser().resolve().name or "repo"
+    except Exception:
+        return "repo"
 
 
 def file_sha1(path: Path) -> str:
@@ -177,6 +185,10 @@ def scan_repo(
     progress_position: int = 1,
     progress_callback: Optional[Callable[[int], None]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    # Resolve to absolute once: with repos.root "." the scan must not store
+    # CWD-relative paths (they break safe_read_text and CGC rel_path joins
+    # as soon as any stage runs from another directory).
+    repo = Path(repo).expanduser().resolve()
     repo_id = repo_id_from_path(repo)
     exclude_dirs = effective_exclude_dirs(cfg)
     max_file_mb = float(cfg["repos"].get("max_file_mb", 2))

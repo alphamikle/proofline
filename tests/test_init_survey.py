@@ -70,6 +70,89 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(AGENT_MENU_ALIASES["codex"], "openai")
 
 
+class AbsPathTests(unittest.TestCase):
+    def test_repo_id_from_dot_resolves_dir_name(self):
+        import tempfile, os
+        from proofline.extractors.repo import repo_id_from_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "myproj"
+            proj.mkdir()
+            old = os.getcwd()
+            os.chdir(proj)
+            try:
+                self.assertEqual(repo_id_from_path(Path(".")), "myproj")
+            finally:
+                os.chdir(old)
+        # Normal paths unchanged.
+        self.assertEqual(repo_id_from_path(Path("/x/detax")), "detax")
+
+    def test_scan_repo_stores_absolute_paths(self):
+        import tempfile, os
+        from proofline.extractors.repo import scan_repo
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / ".git").mkdir()
+            (proj / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+            cfg = {"repos": {"exclude_dirs": [".git"], "max_file_mb": 5,
+                              "include_git_history_metadata": False},
+                   "indexing": {"ast_chunking": {"enabled": False}}}
+            old = os.getcwd()
+            os.chdir(proj)
+            try:
+                inv, files, _, _ = scan_repo(Path("."), cfg)
+            finally:
+                os.chdir(old)
+            self.assertEqual(inv["repo_id"], "proj")
+            self.assertTrue(Path(inv["repo_path"]).is_absolute())
+            self.assertTrue(files)
+            for f in files:
+                self.assertTrue(Path(f["path"]).is_absolute(), f["path"])
+
+    def test_chunks_readable_from_foreign_cwd(self):
+        import tempfile, os
+        from proofline.extractors.code_index import chunks_for_file
+        from proofline.extractors.repo import scan_repo
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / ".git").mkdir()
+            (proj / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+            cfg = {"repos": {"exclude_dirs": [".git"], "max_file_mb": 5,
+                              "include_git_history_metadata": False},
+                   "indexing": {"ast_chunking": {"enabled": False}}}
+            old = os.getcwd()
+            os.chdir(proj)
+            try:
+                _, files, _, _ = scan_repo(Path("."), cfg)
+            finally:
+                os.chdir(old)
+            # Read chunks from a different CWD (the detax bug).
+            os.chdir(tmp)
+            try:
+                cfg2 = {"repos": {"max_file_mb": 5, "include_extensions": [".py"]},
+                        "indexing": {"ast_chunking": {"enabled": False, "fallback_regex": True,
+                                                      "keep_file_windows": True}}}
+                chunks = chunks_for_file(files[0], cfg2, [])
+            finally:
+                os.chdir(old)
+            kinds = {c["kind"] for c in chunks}
+            self.assertIn("symbol", kinds)
+            self.assertIn("file_window", kinds)
+
+    def test_agent_error_hint(self):
+        from proofline.agent.ask import _agent_error_hint
+
+        cfg = {"agent": {"provider": "openai_compatible", "api_key_env": "DEEPSEEK_API_KEY", "model": "m"}}
+        hint = _agent_error_hint("default: 401 Client Error: Unauthorized", cfg)
+        self.assertIn("$DEEPSEEK_API_KEY", hint)
+        self.assertIn("--raw-context", hint)
+        self.assertNotIn("Traceback", hint)
+
+
 class OwnStateTests(unittest.TestCase):
     def test_effective_exclude_dirs_adds_proofline(self):
         from proofline.extractors.repo import effective_exclude_dirs

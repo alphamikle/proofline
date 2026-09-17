@@ -10,6 +10,7 @@ from proofline.storage import KB
 from proofline.agent.tools import KBTools
 from proofline.agent.compose import maybe_llm_answer, render_markdown
 from proofline.agent.loop import run_agentic_ask
+from proofline.agent.providers import AgentProviderError
 from proofline.utils import json_dumps
 
 app = typer.Typer(help="Ask the local corporate knowledge graph")
@@ -168,17 +169,20 @@ def ask(
     setup_logging()
     cfg, kb, tools = tools_for(config)
     try:
-        result = run_agentic_ask(
-            question,
-            tools,
-            cfg,
-            project=project,
-            env=env,
-            window_days=window_days,
-            agent_name=agent_name,
-            quiet=quiet,
-            raw_trace=raw_trace,
-        )
+        try:
+            result = run_agentic_ask(
+                question,
+                tools,
+                cfg,
+                project=project,
+                env=env,
+                window_days=window_days,
+                agent_name=agent_name,
+                quiet=quiet,
+                raw_trace=raw_trace,
+            )
+        except AgentProviderError as e:
+            raise typer.BadParameter(_agent_error_hint(str(e), cfg))
         if raw_context:
             typer.echo(json_dumps(result))
             return
@@ -187,6 +191,27 @@ def ask(
         typer.echo(str(answer or "").strip() or json_dumps(final))
     finally:
         kb.close()
+
+
+def _agent_error_hint(message: str, cfg: Dict[str, Any]) -> str:
+    """Turn an AgentProviderError into an actionable one-liner (no traceback)."""
+    low = message.lower()
+    agent = cfg.get("agent", {}) or {}
+    provider = str(agent.get("provider") or "unknown")
+    key_env = str(agent.get("api_key_env") or "")
+    hint = message
+    if "401" in message or "unauthorized" in low:
+        hint = (
+            f"LLM provider rejected the API key (401, provider={provider}). "
+            + (f"Check ${key_env} is exported and valid." if key_env else "Check the API key.")
+        )
+    elif "404" in message or "not found" in low:
+        hint = f"LLM model not found (provider={provider}, model={agent.get('model')}). Check agent.model."
+    elif "timeout" in low or "timed out" in low:
+        hint = f"LLM request timed out (provider={provider}). Retry or raise agent.request_timeout_seconds."
+    elif "connection" in low or "unreachable" in low or "failed to connect" in low:
+        hint = f"Cannot reach the LLM endpoint (provider={provider}, base_url={agent.get('base_url')}). Is it running?"
+    return hint + " Evidence retrieval still works: re-run with --raw-context."
 
 
 @app.command("impact")

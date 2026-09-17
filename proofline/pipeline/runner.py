@@ -666,6 +666,58 @@ def _stage_code_index_serial(kb: KB, cfg: Dict[str, Any]) -> None:
     console.print(f"chunks: {total_chunks}, repos={len(repos)}, skipped={skipped}")
 
 
+def _log_code_index_preflight(kb: KB, cfg: Dict[str, Any], repo_id: str, repo_files: Any, graph_by_path: dict) -> None:
+    """Log why files may produce no chunks (extension filter, bad paths, graph join)."""
+    from collections import Counter
+
+    from proofline.utils import safe_read_text
+
+    try:
+        allowed = set(cfg.get("repos", {}).get("include_extensions", []) or [])
+        total = len(repo_files)
+        if total:
+            ext_counter: Counter[str] = Counter()
+            for row in repo_files.to_dict("records"):
+                rel = str(row.get("rel_path") or "")
+                name = Path(rel).name
+                ext = Path(rel).suffix or name
+                ext_counter[ext] += 1
+            if allowed:
+                kept = sum(n for ext, n in ext_counter.items() if ext in allowed)
+                # names (Dockerfile) are checked against the name, not the ext
+                kept_names = 0
+                for row in repo_files.to_dict("records"):
+                    rel = str(row.get("rel_path") or "")
+                    ext_here = Path(rel).suffix or Path(rel).name
+                    if ext_here not in allowed and Path(rel).name in allowed:
+                        kept_names += 1
+                top_skipped = [(e, n) for e, n in ext_counter.most_common(5) if e not in allowed]
+                console.print(
+                    f"code_index preflight {repo_id}: files={total}, "
+                    f"pass_extension_filter~{kept + kept_names}, "
+                    f"top_skipped_ext={top_skipped or 'none'}",
+                    highlight=False,
+                )
+            graph_hit = sum(1 for row in repo_files.to_dict("records") if str(row.get("rel_path") or "") in graph_by_path)
+            console.print(
+                f"code_index preflight {repo_id}: graph_symbols_join={graph_hit}/{total} files",
+                highlight=False,
+            )
+            # Path readability probe on a few files (catches CWD-relative paths).
+            unreadable = 0
+            for row in repo_files.to_dict("records")[:5]:
+                if safe_read_text(Path(str(row.get("path") or "")), max_bytes=1024) is None:
+                    unreadable += 1
+            if unreadable:
+                console.print(
+                    f"[yellow]code_index preflight {repo_id}: {unreadable}/5 sampled paths unreadable "
+                    f"(stored paths may be CWD-relative; run from the repo root or re-run repo_ingest)[/yellow]",
+                    highlight=False,
+                )
+    except Exception as e:
+        console.print(f"code_index preflight {repo_id}: diagnostics failed: {e}", highlight=False)
+
+
 def _load_code_index_graph_symbols(kb: KB, cfg: Dict[str, Any], repo_id: str) -> pd.DataFrame:
     ast_cfg = ast_chunking_config(cfg)
     if not ast_cfg.get("enabled", True):
@@ -824,6 +876,11 @@ def _index_code_repo(
     graph_symbols = _load_code_index_graph_symbols(kb, cfg, repo_id)
     graph_by_path = _graph_symbols_by_path(graph_symbols)
     fingerprint = repo_files_fingerprint(repo_files, cfg, graph_symbols)
+    # Pre-flight diagnostics: extension filter vs actual files, graph join
+    # coverage, and path readability. Logged every run so a silent "0 chunks"
+    # (e.g. repos.root "." run from another CWD, or CGC rel_path mismatch)
+    # is diagnosable without SQL spelunking.
+    _log_code_index_preflight(kb, cfg, repo_id, repo_files, graph_by_path)
     existing = kb.query_df(
         """
         SELECT status, source_fingerprint, chunk_count
