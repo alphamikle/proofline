@@ -235,9 +235,47 @@ def _complete_anthropic_messages(
 
 def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], agent: Dict[str, Any]) -> Dict[str, Any]:
     timeout = int(agent.get("request_timeout_seconds") or 600)
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    response.raise_for_status()
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+    except Exception as e:
+        raise _http_error(e, url, agent)
     return response.json()
+
+
+def _http_error(error: Exception, url: str, agent: Dict[str, Any]) -> AgentProviderError:
+    """Explicit, key-safe error: what failed, where, and how to fix it."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    provider = str(agent.get("provider") or "unknown")
+    model = agent.get("model")
+    host = url.split("/")[2] if "://" in url else url
+    if status == 401:
+        key_ref = agent.get("api_key_env") or "the configured key"
+        return AgentProviderError(
+            f"LLM auth failed (401) at {host}: the API key was rejected. "
+            f"Check the value behind {key_ref!r} (env var or literal in config) "
+            f"and that it matches provider={provider}. Key seen: {_redact_key(_key_for_error(agent))}."
+        )
+    if status == 404:
+        return AgentProviderError(
+            f"LLM model not found (404) at {host}: model={model!r} for provider={provider}. "
+            "Check agent.model."
+        )
+    if status == 429:
+        return AgentProviderError(
+            f"LLM rate limited (429) at {host}: retry later or lower request rate."
+        )
+    if status:
+        return AgentProviderError(f"LLM request failed ({status}) at {host}: {error}")
+    return AgentProviderError(f"LLM request failed at {host}: {error}")
+
+
+def _key_for_error(agent: Dict[str, Any]) -> str | None:
+    """Best-effort key fingerprint source for error messages (never logged raw)."""
+    try:
+        return _configured_env(agent, "api_key_env", "")
+    except Exception:
+        return None
 
 
 def _add_common_generation_params(payload: Dict[str, Any], agent: Dict[str, Any], max_tokens_key: str) -> None:
@@ -272,7 +310,33 @@ def _configured_env(agent: Dict[str, Any], key: str, default_name: str) -> str |
     configured = agent.get(key)
     if configured == "":
         return None
-    return _env(str(configured or default_name))
+    name = str(configured or default_name)
+    value = _env(name)
+    if value:
+        return value
+    # Fallback: the value itself may be a literal secret pasted into the
+    # config instead of an env var name (e.g. api_key_env: sk-...).
+    # Heuristic: env var names look like UPPER_SNAKE; anything else with
+    # secret-like length/content is treated as the literal value.
+    if name and not _looks_like_env_name(name):
+        return name
+    return None
+
+
+def _looks_like_env_name(value: str) -> bool:
+    import re
+
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", value.strip()))
+
+
+def _redact_key(value: str | None) -> str:
+    """Short non-reversible fingerprint for logs (never the key itself)."""
+    import hashlib
+
+    if not value:
+        return "<missing>"
+    digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"<key sha256:{digest} len={len(value)}>"
 
 
 def _env(name: str | None) -> str | None:

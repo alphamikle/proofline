@@ -195,22 +195,27 @@ def ask(
 
 def _agent_error_hint(message: str, cfg: Dict[str, Any]) -> str:
     """Turn an AgentProviderError into an actionable one-liner (no traceback)."""
-    low = message.lower()
-    agent = cfg.get("agent", {}) or {}
-    provider = str(agent.get("provider") or "unknown")
-    key_env = str(agent.get("api_key_env") or "")
-    hint = message
-    if "401" in message or "unauthorized" in low:
-        hint = (
-            f"LLM provider rejected the API key (401, provider={provider}). "
-            + (f"Check ${key_env} is exported and valid." if key_env else "Check the API key.")
-        )
-    elif "404" in message or "not found" in low:
-        hint = f"LLM model not found (provider={provider}, model={agent.get('model')}). Check agent.model."
-    elif "timeout" in low or "timed out" in low:
-        hint = f"LLM request timed out (provider={provider}). Retry or raise agent.request_timeout_seconds."
-    elif "connection" in low or "unreachable" in low or "failed to connect" in low:
-        hint = f"Cannot reach the LLM endpoint (provider={provider}, base_url={agent.get('base_url')}). Is it running?"
+    # providers._http_error already produces explicit messages; pass through
+    # anything that looks like one, only appending the raw-context fallback.
+    if message.startswith("LLM "):
+        hint = message
+    else:
+        low = message.lower()
+        agent = cfg.get("agent", {}) or {}
+        provider = str(agent.get("provider") or "unknown")
+        key_env = str(agent.get("api_key_env") or "")
+        hint = message
+        if "401" in message or "unauthorized" in low:
+            hint = (
+                f"LLM provider rejected the API key (401, provider={provider}). "
+                + (f"Check ${key_env} is exported and valid." if key_env else "Check the API key.")
+            )
+        elif "404" in message or "not found" in low:
+            hint = f"LLM model not found (provider={provider}, model={agent.get('model')}). Check agent.model."
+        elif "timeout" in low or "timed out" in low:
+            hint = f"LLM request timed out (provider={provider}). Retry or raise agent.request_timeout_seconds."
+        elif "connection" in low or "unreachable" in low or "failed to connect" in low:
+            hint = f"Cannot reach the LLM endpoint (provider={provider}, base_url={agent.get('base_url')}). Is it running?"
     return hint + " Evidence retrieval still works: re-run with --raw-context."
 
 

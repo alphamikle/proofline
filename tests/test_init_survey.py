@@ -143,6 +143,43 @@ class AbsPathTests(unittest.TestCase):
             self.assertIn("symbol", kinds)
             self.assertIn("file_window", kinds)
 
+    def test_literal_key_fallback(self):
+        import os
+        from proofline.agent.providers import _configured_env
+
+        os.environ["TEST_PFL_FIXTURE"] = "env-secret"
+        try:
+            self.assertEqual(
+                _configured_env({"api_key_env": "TEST_PFL_FIXTURE"}, "api_key_env", "X"), "env-secret")
+        finally:
+            del os.environ["TEST_PFL_FIXTURE"]
+        # Pasted literal key used as-is when no such env var exists.
+        self.assertEqual(
+            _configured_env({"api_key_env": "sk-abc123"}, "api_key_env", "X"), "sk-abc123")
+        # Missing UPPER_SNAKE name -> None, never treated as a key.
+        self.assertIsNone(
+            _configured_env({"api_key_env": "MISSING_VAR_XYZ"}, "api_key_env", "X"))
+        # Empty string disables auth.
+        self.assertIsNone(_configured_env({"api_key_env": ""}, "api_key_env", "X"))
+
+    def test_http_401_is_explicit_and_redacted(self):
+        from proofline.agent.providers import _http_error, AgentProviderError
+
+        class FakeResp:
+            status_code = 401
+
+        class FakeErr(Exception):
+            def __init__(self):
+                self.response = FakeResp()
+                super().__init__("401 Client Error")
+
+        err = _http_error(FakeErr(), "https://api.deepseek.com/v1/chat/completions",
+                          {"provider": "openai_compatible", "api_key_env": "sk-test-literal", "model": "m"})
+        self.assertIsInstance(err, AgentProviderError)
+        msg = str(err)
+        self.assertIn("401", msg)
+        self.assertIn("sha256", msg)
+
     def test_agent_error_hint(self):
         from proofline.agent.ask import _agent_error_hint
 

@@ -441,7 +441,17 @@ def configured_env(section: Dict[str, Any], key: str, default_name: str) -> str 
     configured = section.get(key)
     if configured == "":
         return None
-    return env_value(str(configured or default_name))
+    name = str(configured or default_name)
+    value = env_value(name)
+    if value:
+        return value
+    # Same literal-secret fallback as agent providers: a pasted key is used
+    # as-is when it does not look like an env var name.
+    import re
+
+    if name and not re.fullmatch(r"[A-Z][A-Z0-9_]*", name.strip()):
+        return name
+    return None
 
 
 def env_value(name: str | None) -> str | None:
